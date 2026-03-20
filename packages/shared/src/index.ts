@@ -28,17 +28,83 @@ export interface MissingFieldResolution {
   source: "user" | "wallet-balance-context"
 }
 
+export type DecisionTraceStage =
+  | "intent-parsing"
+  | "missing-field-resolution"
+  | "liquidity-discovery"
+  | "route-comparison"
+  | "price-impact-assessment"
+  | "mev-risk-assessment"
+  | "payload-construction"
+  | "guardrail-application"
+  | "submission-strategy"
+  | "final-recommendation"
+
+export interface DecisionTraceField {
+  label: string
+  value: string
+}
+
+export interface DecisionTraceStep {
+  id: string
+  stage: DecisionTraceStage
+  title: string
+  status: "completed" | "needs-input" | "failed"
+  summary: string
+  inputs: DecisionTraceField[]
+  observations: DecisionTraceField[]
+  decision?: string
+  artifacts: DecisionTraceField[]
+}
+
+export type PlanningEventKind =
+  | "stage-started"
+  | "stage-completed"
+  | "stage-failed"
+  | "tool-started"
+  | "tool-succeeded"
+  | "tool-failed"
+  | "reasoning"
+  | "follow-up-required"
+  | "plan-completed"
+
+export type PlanningEventStatus = "running" | "completed" | "failed" | "needs-input"
+export type ReasoningSource = "deterministic" | "llm"
+
+export interface PlanningEvent {
+  id: string
+  kind: PlanningEventKind
+  timestamp: string
+  sessionId?: string
+  stage: DecisionTraceStage
+  status: PlanningEventStatus
+  message: string
+  data?: {
+    title?: string
+    toolName?: string
+    inputPreview?: DecisionTraceField[]
+    outputPreview?: DecisionTraceField[]
+    observations?: DecisionTraceField[]
+    decision?: string
+    reasoningSource?: ReasoningSource
+    model?: string
+    promptVersion?: string
+    artifacts?: DecisionTraceField[]
+    question?: string
+    missingField?: UnknownField
+    intent?: StructuredIntent
+    missingFieldsResolved?: MissingFieldResolution[]
+    state?: PlanningSessionState
+    result?: PlanningResult
+    error?: string
+  }
+}
+
 export interface TokenRef {
   symbol: string
   address: string
   decimals: number
   isNative?: boolean
-}
-
-export interface ToolObservation {
-  tool: string
-  input: Record<string, unknown>
-  output: unknown
 }
 
 export interface LiquidityVenueShare {
@@ -76,6 +142,12 @@ export interface PriceImpactAssessment {
   commentary: string
 }
 
+export type SubmissionPath =
+  | "public-mempool"
+  | "private-rpc"
+  | "multi-builder-broadcast"
+  | "intent-api"
+
 export interface MevRiskAssessment {
   level: "high" | "medium" | "low"
   summary: string
@@ -100,11 +172,6 @@ export interface PayloadCandidate {
     note: string
   }
 }
-
-export type SubmissionPath =
-  | "public-mempool"
-  | "private-rpc"
-  | "multi-builder-broadcast"
 
 export interface SubmissionCandidate {
   path: SubmissionPath
@@ -141,9 +208,38 @@ export interface AlternativeRejected {
   reason: string
 }
 
+export interface PublicTransactionRequest {
+  chainId: number
+  from?: string
+  to: string
+  data: string
+  value: string
+  gas?: string
+  rationale: string
+}
+
+export interface PrivateSubmissionRequest {
+  mode: "private-rpc"
+  network: Network
+  routeId: string
+  payloadId: string
+  note: string
+  guardrails: Guardrail[]
+}
+
+export interface IntentSubmissionRequest {
+  mode: "intent-api"
+  network: Network
+  intent: StructuredIntent
+  routeId: string
+  payloadType: PayloadType
+  note: string
+}
+
 export interface PlanningResult {
   intent: StructuredIntent
   missingFieldsResolved: MissingFieldResolution[]
+  decisionTrace: DecisionTraceStep[]
   liquiditySnapshot: LiquiditySnapshot
   routeCandidates: RouteCandidate[]
   priceImpactAssessment: PriceImpactAssessment
@@ -153,12 +249,17 @@ export interface PlanningResult {
   guardrails: Guardrail[]
   recommendedPlan: RecommendedPlan
   alternativesRejected: AlternativeRejected[]
+  publicSubmitRequest?: PublicTransactionRequest
+  privateSubmitRequest?: PrivateSubmissionRequest
+  intentSubmitRequest?: IntentSubmissionRequest
 }
 
 export interface FollowUpResponse {
   kind: "follow-up"
   intent: StructuredIntent
   missingFieldsResolved: MissingFieldResolution[]
+  partialDecisionTrace: DecisionTraceStep[]
+  partialEvents: PlanningEvent[]
   question: string
 }
 
@@ -168,45 +269,24 @@ export interface SkillContext {
   submitEnabled?: boolean
 }
 
+export interface PlanningSessionState {
+  rawInput: string
+  intent: StructuredIntent
+  missingFieldsResolved: MissingFieldResolution[]
+  events: PlanningEvent[]
+}
+
 export type SkillResponse = FollowUpResponse | { kind: "plan"; result: PlanningResult }
 
-export interface CapabilityLayer {
-  listTools(): Promise<string[]>
-  getChainInfo(network: Network): Promise<unknown>
-  getNativeBalance(address: string, network: Network): Promise<{ formatted: string; raw: string; symbol?: string }>
-  getErc20Balance(
-    tokenAddress: string,
-    address: string,
-    network: Network
-  ): Promise<{ formatted: string; raw: string; symbol?: string }>
-  getErc20TokenInfo(tokenAddress: string, network: Network): Promise<unknown>
-  resolveToken(query: string, network: Network): Promise<TokenRef | null>
-  getQuoteCandidates(input: {
-    network: Network
-    sellToken: TokenRef
-    buyToken: TokenRef
-    amount: string
-    slippageBps: number
-  }): Promise<RouteCandidate[]>
-  encodeRouterCalldata(input: {
-    network: Network
-    platform: string
-    sellToken: TokenRef
-    buyToken: TokenRef
-    amount: string
-    slippageBps: number
-    account: string
-  }): Promise<Omit<PayloadCandidate, "id" | "type" | "simulation">>
-  simulateTransaction(input: {
-    network: Network
-    to: string
-    data: string
-    value: string
-  }): Promise<{ ok: boolean; estimatedGas: string; note: string }>
-  getSubmissionPaths(input: {
-    network: Network
-    mevRiskLevel: MevRiskAssessment["level"]
-    preferPrivate: boolean | null
-  }): Promise<SubmissionCandidate[]>
-  close(): Promise<void>
+export interface PlanningSessionSnapshot {
+  sessionId: string
+  status: "awaiting_follow_up" | "planned"
+  rawMessage: string
+  context: SkillContext
+  state: PlanningSessionState
+  events: PlanningEvent[]
+  currentStage?: DecisionTraceStage
+  followUp?: { question: string; missingField: UnknownField }
+  finalResult?: PlanningResult
+  response?: SkillResponse
 }

@@ -4,7 +4,7 @@ import type {
   PayloadCandidate,
   RouteCandidate,
   StructuredIntent
-} from "../types"
+} from "@bsc-swap-agent-demo/shared"
 
 export function buildGuardrails(input: {
   intent: StructuredIntent

@@ -1,6 +1,6 @@
-import type { PlanningResult } from "../types"
+import type { PlanningResult } from "@bsc-swap-agent-demo/shared"
 
-export function formatPlanningResult(result: PlanningResult): string {
+export function formatPlan(result: PlanningResult): string {
   const recommendedRoute = result.routeCandidates.find(
     (candidate) => candidate.id === result.recommendedPlan.routeId
   )
@@ -8,7 +8,7 @@ export function formatPlanningResult(result: PlanningResult): string {
     (candidate) => candidate.id === result.recommendedPlan.payloadId
   )
 
-  const markdown = [
+  return [
     "## Swap Execution Plan",
     "",
     `Recommended route: ${recommendedRoute?.platform ?? result.recommendedPlan.routeId}`,
@@ -24,10 +24,17 @@ export function formatPlanningResult(result: PlanningResult): string {
     "### Policy note",
     result.recommendedPlan.policyNote,
     "",
+    "### Decision Trace",
+    ...result.decisionTrace.flatMap((step) => [
+      `#### ${step.title}`,
+      step.summary,
+      ...(step.decision ? [`Decision: ${step.decision}`] : []),
+      ...step.observations.slice(0, 4).map((item) => `- ${item.label}: ${item.value}`),
+      ""
+    ]),
+    "",
     "### Alternatives rejected",
-    ...result.alternativesRejected.map(
-      (item) => `- ${item.routeId}: ${item.reason}`
-    ),
+    ...result.alternativesRejected.map((item) => `- ${item.routeId}: ${item.reason}`),
     "",
     "### JSON",
     "```json",
@@ -35,6 +42,7 @@ export function formatPlanningResult(result: PlanningResult): string {
       {
         intent: result.intent,
         missing_fields_resolved: result.missingFieldsResolved,
+        decision_trace: result.decisionTrace,
         liquidity_snapshot: result.liquiditySnapshot,
         route_candidates: result.routeCandidates,
         price_impact_assessment: result.priceImpactAssessment,
@@ -42,25 +50,19 @@ export function formatPlanningResult(result: PlanningResult): string {
         payload_candidates: result.payloadCandidates.map((payload) => ({
           ...payload,
           data: `${payload.data.slice(0, 18)}...`,
-          data_length: payload.data.length,
-          simulation: {
-            ...payload.simulation,
-            note:
-              payload.simulation.note.length > 220
-                ? `${payload.simulation.note.slice(0, 220)}...`
-                : payload.simulation.note
-          }
+          data_length: payload.data.length
         })),
         submission_candidates: result.submissionCandidates,
         guardrails: result.guardrails,
         recommended_plan: result.recommendedPlan,
-        alternatives_rejected: result.alternativesRejected
+        alternatives_rejected: result.alternativesRejected,
+        public_submit_request: result.publicSubmitRequest,
+        private_submit_request: result.privateSubmitRequest,
+        intent_submit_request: result.intentSubmitRequest
       },
       null,
       2
     ),
     "```"
-  ]
-
-  return markdown.join("\n")
+  ].join("\n")
 }

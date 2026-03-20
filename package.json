@@ -3,20 +3,22 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
   "scripts": {
-    "dev": "bun --watch src/cli/demo.ts",
-    "start": "bun src/cli/demo.ts",
-    "check": "bunx tsc --noEmit",
-    "test": "bun test"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.11.0",
-    "dotenv": "^16.5.0",
-    "openai": "^4.104.0",
-    "zod": "^3.25.76"
+    "dev": "bun --watch packages/core/src/cli/demo.ts",
+    "start": "bun packages/core/src/cli/demo.ts",
+    "web:dev": "cd apps/web && bun run dev",
+    "check": "bun ./node_modules/typescript/lib/tsc.js --noEmit -p tsconfig.json && bun ./node_modules/typescript/lib/tsc.js --noEmit -p apps/web/tsconfig.json",
+    "test": "bun test packages/core/src",
+    "test:core": "bun test packages/core/src"
   },
   "devDependencies": {
     "@types/bun": "^1.2.12",
+    "@types/react": "^19.1.3",
+    "@types/react-dom": "^19.1.3",
     "typescript": "^5.9.2"
   }
 }

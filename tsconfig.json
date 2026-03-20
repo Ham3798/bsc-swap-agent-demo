@@ -10,5 +10,7 @@
     "types": ["bun"],
     "outDir": "dist"
   },
-  "include": ["src/**/*.ts"]
+  "include": [
+    "packages/**/*.ts"
+  ]
 }

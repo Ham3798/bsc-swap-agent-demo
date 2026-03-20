@@ -1,15 +1,24 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { config as loadEnv } from "dotenv"
+import type { Address } from "viem"
+import { createPublicClient, http } from "viem"
+import { bsc, bscTestnet } from "viem/chains"
 
 import type {
-  CapabilityLayer,
   MevRiskAssessment,
   Network,
   RouteCandidate,
   SubmissionCandidate,
   TokenRef
-} from "../types"
+} from "@bsc-swap-agent-demo/shared"
+
+import type {
+  CapabilityRegistry,
+  ChainCapabilityAdapter,
+  QuoteCapabilityAdapter,
+  SubmissionCapabilityAdapter
+} from "./types"
 
 loadEnv()
 
@@ -47,39 +56,10 @@ interface OpenOceanSwapQuoteResponse {
   }
 }
 
-export class BnbMcpCapabilityLayer implements CapabilityLayer {
-  private readonly mcp = new Client({ name: "bsc-swap-planning-demo", version: "0.1.0" })
-  private tokenCache = new Map<Network, TokenRef[]>()
+class BnbMcpChainAdapter implements ChainCapabilityAdapter {
+  private readonly mcp = new Client({ name: "bsc-swap-agent-demo", version: "0.2.0" })
+  private readonly tokenCache = new Map<Network, TokenRef[]>()
   private connected = false
-
-  async connect(): Promise<void> {
-    if (this.connected) {
-      return
-    }
-
-    const overrideCommand = process.env.BNB_MCP_COMMAND
-    const overrideArgs = process.env.BNB_MCP_ARGS
-    const mcpDir = process.env.BNB_MCP_DIR || "/Users/ham-yunsig/Documents/bnb/bnbchain-mcp"
-
-    const command = overrideCommand || "/bin/zsh"
-    const args =
-      overrideArgs?.split(" ").filter(Boolean) || [
-        "-lc",
-        `cd ${shellEscape(mcpDir)} && bun run src/index.ts 2>/dev/null`
-      ]
-
-    const transport = new StdioClientTransport({
-      command,
-      args,
-      env: {
-        ...process.env,
-        LOGLEVEL: process.env.LOGLEVEL || "error"
-      }
-    })
-
-    await this.mcp.connect(transport)
-    this.connected = true
-  }
 
   async listTools(): Promise<string[]> {
     await this.connect()
@@ -115,13 +95,101 @@ export class BnbMcpCapabilityLayer implements CapabilityLayer {
     }
 
     const list = await this.getTokenList(network)
-    const direct = list.find(
-      (token) =>
-        token.symbol.toUpperCase() === normalized ||
-        token.address.toLowerCase() === query.toLowerCase()
+    return (
+      list.find(
+        (token) =>
+          token.symbol.toUpperCase() === normalized ||
+          token.address.toLowerCase() === query.toLowerCase()
+      ) ?? null
     )
-    return direct ?? null
   }
+
+  async estimateGas(input: {
+    network: Network
+    to: string
+    data?: string
+    value?: string
+  }): Promise<{ estimatedGas?: string }> {
+    return this.callMcp("estimate_gas", input)
+  }
+
+  async close(): Promise<void> {
+    if (this.connected) {
+      await this.mcp.close()
+      this.connected = false
+    }
+  }
+
+  private async connect(): Promise<void> {
+    if (this.connected) {
+      return
+    }
+
+    const overrideCommand = process.env.BNB_MCP_COMMAND
+    const overrideArgs = process.env.BNB_MCP_ARGS
+    const mcpDir = process.env.BNB_MCP_DIR || "/Users/ham-yunsig/Documents/bnb/bnbchain-mcp"
+    const command = overrideCommand || "/bin/zsh"
+    const args =
+      overrideArgs?.split(" ").filter(Boolean) || [
+        "-lc",
+        `cd ${shellEscape(mcpDir)} && bun run src/index.ts 2>/dev/null`
+      ]
+
+    const transport = new StdioClientTransport({
+      command,
+      args,
+      env: {
+        ...process.env,
+        LOGLEVEL: process.env.LOGLEVEL || "error"
+      }
+    })
+
+    await this.mcp.connect(transport)
+    this.connected = true
+  }
+
+  private async callMcp(name: string, args: Record<string, unknown>): Promise<any> {
+    await this.connect()
+    const response = await this.mcp.callTool({
+      name,
+      arguments: args
+    })
+    const first = Array.isArray(response.content) ? response.content[0] : undefined
+    const text = first && "type" in first && first.type === "text" && "text" in first ? first.text : ""
+    if (!text) {
+      throw new Error(`Empty MCP response for ${name}`)
+    }
+    if (text.startsWith("Error ")) {
+      throw new Error(text)
+    }
+    return JSON.parse(text)
+  }
+
+  private async getTokenList(network: Network): Promise<TokenRef[]> {
+    const cached = this.tokenCache.get(network)
+    if (cached) {
+      return cached
+    }
+
+    const response = (await fetchJson(
+      `https://open-api.openocean.finance/v3/${network}/tokenList`
+    )) as OpenOceanTokenListResponse
+    if (response.code !== 200) {
+      throw new Error(`Failed to load token list for ${network}`)
+    }
+
+    const list = response.data.map((token) => ({
+      symbol: token.symbol,
+      address: token.address,
+      decimals: token.decimals
+    }))
+    this.tokenCache.set(network, list)
+    return list
+  }
+}
+
+class OpenOceanQuoteAdapter implements QuoteCapabilityAdapter {
+  constructor(private readonly chain: ChainCapabilityAdapter) {}
 
   async getQuoteCandidates(input: {
     network: Network
@@ -212,22 +280,23 @@ export class BnbMcpCapabilityLayer implements CapabilityLayer {
 
   async simulateTransaction(input: {
     network: Network
+    account: string
     to: string
     data: string
     value: string
   }): Promise<{ ok: boolean; estimatedGas: string; note: string }> {
     try {
-      const valueEth = input.value === "0" ? undefined : formatUnits(input.value, 18)
-      const res = (await this.callMcp("estimate_gas", {
-        network: input.network,
-        to: input.to,
-        data: input.data,
-        value: valueEth
-      })) as { estimatedGas?: string }
+      const client = getRpcClient(input.network)
+      const gas = await client.estimateGas({
+        account: input.account as Address,
+        to: input.to as Address,
+        data: input.data as `0x${string}`,
+        value: input.value === "0" ? undefined : BigInt(input.value)
+      })
       return {
         ok: true,
-        estimatedGas: res.estimatedGas ?? "0",
-        note: "Gas estimated through bnbchain-mcp estimate_gas."
+        estimatedGas: gas.toString(),
+        note: `Gas estimated through direct ${input.network} RPC simulation with account context.`
       }
     } catch (error) {
       return {
@@ -237,7 +306,9 @@ export class BnbMcpCapabilityLayer implements CapabilityLayer {
       }
     }
   }
+}
 
+class AdvisorySubmissionAdapter implements SubmissionCapabilityAdapter {
   async getSubmissionPaths(input: {
     network: Network
     mevRiskLevel: MevRiskAssessment["level"]
@@ -250,14 +321,21 @@ export class BnbMcpCapabilityLayer implements CapabilityLayer {
         availability: "stub",
         recommended: privatePreferred,
         rationale:
-          "Private RPC is advisory in MVP, but it is the preferred path when MEV sensitivity is meaningful."
+          "Private RPC is advisory in this stage, but it is the preferred path when MEV sensitivity is meaningful."
       },
       {
         path: "multi-builder-broadcast",
         availability: "stub",
         recommended: privatePreferred && input.mevRiskLevel === "high",
         rationale:
-          "Builder-aware broadcast is advisory in MVP and represents the preferred BSC PBS-aware path under higher extraction risk."
+          "Builder-aware broadcast is advisory in this stage and represents the preferred BSC PBS-aware path under higher extraction risk."
+      },
+      {
+        path: "intent-api",
+        availability: "stub",
+        recommended: false,
+        rationale:
+          "Intent API handoff is reserved for the later relayer-backed stage and is included now as a request-contract boundary."
       },
       {
         path: "public-mempool",
@@ -269,52 +347,54 @@ export class BnbMcpCapabilityLayer implements CapabilityLayer {
       }
     ]
   }
+}
+
+export class BnbCapabilityRegistry implements CapabilityRegistry {
+  readonly chain: ChainCapabilityAdapter
+  readonly quote: QuoteCapabilityAdapter
+  readonly submission: SubmissionCapabilityAdapter
+
+  constructor() {
+    const chain = new BnbMcpChainAdapter()
+    this.chain = chain
+    this.quote = new OpenOceanQuoteAdapter(chain)
+    this.submission = new AdvisorySubmissionAdapter()
+  }
 
   async close(): Promise<void> {
-    if (this.connected) {
-      await this.mcp.close()
-      this.connected = false
+    if ("close" in this.chain && typeof this.chain.close === "function") {
+      await (this.chain as BnbMcpChainAdapter).close()
     }
   }
+}
 
-  private async callMcp(name: string, args: Record<string, unknown>): Promise<any> {
-    await this.connect()
-    const response = await this.mcp.callTool({
-      name,
-      arguments: args
-    })
-    const first = Array.isArray(response.content) ? response.content[0] : undefined
-    const text = first && "type" in first && first.type === "text" && "text" in first ? first.text : ""
-    if (!text) {
-      throw new Error(`Empty MCP response for ${name}`)
-    }
-    if (text.startsWith("Error ")) {
-      throw new Error(text)
-    }
-    return JSON.parse(text)
+function getRpcClient(network: Network) {
+  const rpcUrl =
+    network === "bsc" ? process.env.BSC_RPC_URL : process.env.BSC_TESTNET_RPC_URL
+  if (!rpcUrl) {
+    throw new Error(
+      network === "bsc"
+        ? "Missing BSC_RPC_URL for direct RPC simulation."
+        : "Missing BSC_TESTNET_RPC_URL for direct RPC simulation."
+    )
   }
 
-  private async getTokenList(network: Network): Promise<TokenRef[]> {
-    const cached = this.tokenCache.get(network)
-    if (cached) {
-      return cached
-    }
+  return createPublicClient({
+    chain: network === "bsc" ? bsc : bscTestnet,
+    transport: http(rpcUrl)
+  })
+}
 
-    const response = (await fetchJson(
-      `https://open-api.openocean.finance/v3/${network}/tokenList`
-    )) as OpenOceanTokenListResponse
-    if (response.code !== 200) {
-      throw new Error(`Failed to load token list for ${network}`)
+async function fetchJson(url: string): Promise<unknown> {
+  const response = await fetch(url, {
+    headers: {
+      accept: "application/json"
     }
-
-    const list = response.data.map((token) => ({
-      symbol: token.symbol,
-      address: token.address,
-      decimals: token.decimals
-    }))
-    this.tokenCache.set(network, list)
-    return list
+  })
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status} for ${url}`)
   }
+  return response.json()
 }
 
 function normalizeDexShares(
@@ -333,34 +413,12 @@ function normalizeDexShares(
     .slice(0, 5)
 }
 
-async function fetchJson(url: string): Promise<unknown> {
-  const response = await fetch(url, {
-    headers: {
-      accept: "application/json"
-    }
-  })
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status} for ${url}`)
-  }
-  return response.json()
-}
-
 function trimFloat(value: string): string {
   const num = Number(value)
   if (!Number.isFinite(num)) {
     return value
   }
   return num.toFixed(num >= 100 ? 4 : 6).replace(/\.?0+$/, "")
-}
-
-export function formatUnits(raw: string, decimals: number): string {
-  const normalized = raw.replace(/^(-?)(\d+)$/, "$1$2")
-  const sign = normalized.startsWith("-") ? "-" : ""
-  const digits = sign ? normalized.slice(1) : normalized
-  const padded = digits.padStart(decimals + 1, "0")
-  const head = padded.slice(0, -decimals) || "0"
-  const tail = padded.slice(-decimals).replace(/0+$/, "")
-  return tail ? `${sign}${head}.${tail}` : `${sign}${head}`
 }
 
 function parsePercentString(value: string | undefined): number {
@@ -374,4 +432,14 @@ function parsePercentString(value: string | undefined): number {
 
 function shellEscape(input: string): string {
   return `'${input.replace(/'/g, `'\"'\"'`)}'`
+}
+
+export function formatUnits(raw: string, decimals: number): string {
+  const normalized = raw.replace(/^(-?)(\d+)$/, "$1$2")
+  const sign = normalized.startsWith("-") ? "-" : ""
+  const digits = sign ? normalized.slice(1) : normalized
+  const padded = digits.padStart(decimals + 1, "0")
+  const head = padded.slice(0, -decimals) || "0"
+  const tail = padded.slice(-decimals).replace(/0+$/, "")
+  return tail ? `${sign}${head}.${tail}` : `${sign}${head}`
 }

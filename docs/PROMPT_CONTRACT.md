@@ -108,3 +108,49 @@ If the plan cannot proceed due to a missing field:
   - `You currently hold X token. How much would you like to swap?`
 
 The skill should not ask unnecessary questions and should not silently fill in unknown critical values.
+
+## 5. Stage Reasoning Summarizer
+
+Purpose:
+
+- turn compact tool observations into short intermediate reasoning summaries
+
+Allowed inputs:
+
+- `stage`
+- `intent`
+- `toolObservations`
+- `currentCandidates`
+- `recommendedCandidate`
+- `rejectedCandidates`
+- `mevAssessment`
+- `priceImpactAssessment`
+- `submissionCandidates`
+
+Return JSON only.
+
+```json
+{
+  "summary": "string",
+  "decision": "string",
+  "observations": [
+    {
+      "label": "string",
+      "value": "string"
+    }
+  ]
+}
+```
+
+Rules:
+
+- `summary` must be 1-2 sentences
+- `decision` must be 1 sentence
+- `observations` must contain at most 3 items
+- do not reveal chain-of-thought
+- do not dump full prompts, calldata, RPC payloads, or quote blobs
+- use only the provided structured inputs
+
+Prompt version:
+
+- `stage-summary-v1`
