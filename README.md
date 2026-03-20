@@ -1,6 +1,6 @@
-# BSC Swap Execution Planning Demo
+# BSC Swap Agent Demo
 
-Minimal MVP for a `swap-execution-planning` skill demo on top of BNB Chain MCP.
+Minimal MVP for a `swap-execution-planning` agent demo on top of BNB Chain MCP.
 
 Core goal:
 
@@ -24,6 +24,8 @@ Start here if you want to use this project as an agent skill:
 - live quote candidates through OpenOcean public APIs
 - advisory submission-path reasoning for private RPC and builder-aware paths
 - dry-run only output with markdown summary plus JSON
+
+This repo is the root project for the current planning demo and the future web chatbot demo.
 
 ## Run
 
