@@ -1,9 +1,15 @@
 import type {
+  ExecutionCapabilityUsage,
+  ExecutionCapabilitySummary,
   MevRiskAssessment,
   Network,
+  PrivatePathRegistrySummary,
+  ProviderUniverseSnapshot,
+  QuoteProviderAuditEntry,
   RouteCandidate,
   SubmissionCandidate,
-  TokenRef
+  TokenRef,
+  VenueCoverageSnapshot
 } from "@bsc-swap-agent-demo/shared"
 
 export interface ChainCapabilityAdapter {
@@ -34,14 +40,28 @@ export interface QuoteCapabilityAdapter {
     sellToken: TokenRef
     buyToken: TokenRef
     amount: string
+    amountRaw: string
     slippageBps: number
   }): Promise<RouteCandidate[]>
+  getQuoteCandidatesWithAudit?(input: {
+    network: Network
+    sellToken: TokenRef
+    buyToken: TokenRef
+    amount: string
+    amountRaw: string
+    slippageBps: number
+  }): Promise<{
+    candidates: RouteCandidate[]
+    audit: QuoteProviderAuditEntry[]
+    observedAt: string
+  }>
   encodeRouterCalldata(input: {
     network: Network
     platform: string
     sellToken: TokenRef
     buyToken: TokenRef
     amount: string
+    amountRaw: string
     slippageBps: number
     account: string
   }): Promise<{
@@ -67,11 +87,52 @@ export interface SubmissionCapabilityAdapter {
     mevRiskLevel: MevRiskAssessment["level"]
     preferPrivate: boolean | null
   }): Promise<SubmissionCandidate[]>
+  getPrivatePathRegistrySummary?(input: {
+    network: Network
+  }): Promise<PrivatePathRegistrySummary | undefined>
+  getExecutionCapabilitySummary?(input: {
+    network: Network
+  }): Promise<ExecutionCapabilitySummary | undefined>
+  simulateCandidateRoutes?(input: {
+    network: Network
+    sellToken: TokenRef
+    buyToken: TokenRef
+    amount: string
+    slippageBps: number
+    account: string
+    routeIds?: string[]
+  }): Promise<{
+    routeIds: string[]
+    confirmed: boolean
+    note: string
+    usage: ExecutionCapabilityUsage
+  }>
+}
+
+export interface MarketIntelligenceAdapter {
+  discoverBscDexUniverse(input: {
+    network: Network
+  }): Promise<Array<{ id: string; displayName: string; volume24h?: number | null; category: "aggregator" | "dex" }>>
+  getChainDexOverview(input: {
+    network: Network
+  }): Promise<Array<{ name: string; displayName: string; volume24h?: number | null }>>
+  getDexSummary(input: {
+    protocol: string
+  }): Promise<{ name: string; displayName: string; volume24h?: number | null; chains?: string[] } | null>
+  buildCuratedUniverseSnapshot(input: {
+    network: Network
+  }): Promise<ProviderUniverseSnapshot>
+  getVenueCoverageSnapshot(input: {
+    network: Network
+    observedDexes: string[]
+    pair?: { sellToken: string; buyToken: string }
+  }): Promise<VenueCoverageSnapshot>
 }
 
 export interface CapabilityRegistry {
   chain: ChainCapabilityAdapter
   quote: QuoteCapabilityAdapter
   submission: SubmissionCapabilityAdapter
+  market: MarketIntelligenceAdapter
   close(): Promise<void>
 }

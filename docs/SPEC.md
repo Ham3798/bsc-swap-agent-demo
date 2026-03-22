@@ -2,152 +2,130 @@
 
 ## Goal
 
-Implement a minimal `swap-execution-planning skill` demo that takes one natural-language swap request and shows the internal execution-planning decisions.
+Turn the repo from a single `swap-execution-planning` demo into a small execution stack with:
 
-Core question:
+- `bnbchain-mcp` for chain reads
+- `bsc-execution-mcp` for execution ops and audit
+- multiple skill contracts for planning, private execution, audit, gasless, and JIT routing
 
-`A token 하나 B로 스왑해줘`
+## Current runtime split
 
-Canonical demo prompt:
+### Planning path
 
-`Swap 100 USDT to BNB with low MEV risk`
-
-The demo must show how the skill reasons about:
-
-- intent
-- liquidity sources
-- route candidates
-- price impact
-- MEV exposure
-- best price vs best execution
-- payload shape
+- natural-language swap planning
+- quote observation
+- payload construction
+- simulation
 - guardrails
-- submission strategy
+- public wallet handoff contract
 
-## Non-Goals
+### Execution ops path
 
-- generic agent framework
-- production wallet UX
-- real private builder integration
-- bundle submission
-- full swap execution in the first demo path
-- transfer-first demo narratives
+- signed raw private submission
+- multi-builder raw broadcast
+- endpoint probing
 
-## Single Demo Flow
+### Audit path
 
-1. User asks for a swap in natural language.
-2. Skill extracts structured intent.
-3. If required fields are missing, skill uses a follow-up loop.
-4. Skill queries MCP tools for balances, token metadata, liquidity, and route context.
-5. Skill compares route candidates by price impact and expected execution quality.
-6. Skill evaluates MEV exposure and possible submission paths.
-7. Skill constructs payload candidates.
-8. Skill applies deterministic guardrails.
-9. Skill emits a final recommendation.
-10. Optional submit is secondary and must stay off by default.
+- receipt status
+- gas
+- latency
+- realized output
 
-## Follow-Up Loop
+## Non-goals for this stage
 
-Follow-up is required behavior, not an exception path.
+- moving signing into the planner
+- making gasless live before sponsor policy exists
+- hiding trust boundaries between planner and execution ops
 
-Examples:
+## MCP layers
 
-- If amount is missing, the skill may first read wallet balance.
-- Then it may ask:
-  - `You currently hold X token. How much would you like to swap?`
+### `bnbchain-mcp`
 
-Rules:
-
-- ask as few questions as possible
-- only ask when the missing field materially blocks planning
-- use current observations when asking
-- unresolved required fields must remain explicit
-
-## Required MCP Tools
-
-### Core read/planning tools
+Read-focused chain capability layer:
 
 - `get_chain_info`
 - `get_native_balance`
 - `get_erc20_balance`
 - `get_erc20_token_info`
-- `get_quote_candidates`
-- `simulate_transaction`
-- `encode_router_calldata`
-- `get_submission_paths`
-
-### Optional context tools
-
-- `read_contract`
-- `is_contract`
 - `estimate_gas`
+- optional:
+  - `get_transaction_receipt`
+  - `get_logs`
+  - `read_contract`
+  - `is_contract`
 
-### Advisory or stub tools in V1
+### `bsc-execution-mcp`
 
-- `private_rpc_submit`
-- `multi_builder_broadcast`
-- `builder_path_score`
+Execution-focused capability layer:
 
-### De-emphasized tools
+- `get_private_endpoint_registry`
+- `probe_private_endpoint`
+- `private_rpc_submit_raw`
+- `multi_builder_broadcast_raw`
+- `audit_swap_execution`
+- `simulate_candidate_routes`
 
-- `transfer_native_token`
-- `transfer_erc20`
+Later additions:
 
-These may exist in the wider stack but are not part of the main demo path.
+- `sponsor_policy_check`
+- `build_bundle`
+- `quote_bundle_price`
+- `submit_bundle`
+- `encode_jit_router_call`
 
-## Required Decision Stack
+## Skill catalog
 
-The skill must explicitly produce or make visible the following chain:
+### `swap-execution-planning`
 
-1. Intent parsing
-2. Missing field resolution
-3. Liquidity discovery
-4. Price impact comparison
-5. MEV risk assessment
-6. Best execution reasoning
-7. Payload construction
-8. Guardrail application
-9. Submission strategy selection
-10. Final recommendation
+- natural-language planning
+- route and payload comparison
+- guardrails
+- readiness and handoff contract
 
-## Guardrails
+### `private-execution-ops`
 
-Deterministic rules must enforce:
+- signed raw tx submission to private endpoints
+- multi-builder broadcast
 
-- write tools disabled in dry-run
-- follow-up before failure when a missing field is resolvable
-- stop when required fields remain unresolved
-- simulation required for swap payload candidates
-- slippage bound required for swap recommendation
-- deadline required for swap recommendation
-- public path risk must be surfaced when private path is unavailable
+### `swap-execution-audit`
 
-## Required Output
+- receipt and realized execution report
 
-The final result must include:
+### `gasless-bundle-execution`
 
-- `intent`
-- `missing_fields_resolved`
-- `liquidity_snapshot`
-- `route_candidates`
-- `price_impact_assessment`
-- `mev_risk_assessment`
-- `payload_candidates`
-- `submission_candidates`
-- `guardrails`
-- `recommended_plan`
-- `alternatives_rejected`
-- `submit_result?`
+- sponsor policy and bundle flow
+- interface-first in this stage
 
-The output must explain why the chosen plan is better than plausible alternatives.
+### `jit-routing`
 
-## Submit Rules
+- JIT router payload and fallback ordering
+- contract primitive exists
+- planner integration pending
 
-- default mode is `dry-run`
-- optional submit exists only as a secondary capability
-- swap submit is not required in the first demo path
-- if submit is later enabled, it must be explicitly visible in the output
+## Status by capability
 
-## One-Line Success Criterion
+- planning path: live
+- private raw submission: implemented outside planner
+- execution audit: implemented outside planner
+- gasless / bundle: not implemented
+- JIT router contract: implemented
+- JIT planner integration: pending
 
-A viewer should be able to see one swap request and understand why the agent chose a specific route, payload, submission path, and set of guardrails.
+## Runtime policy
+
+- planner CLI and web path stay planning-first
+- planner surfaces execution capability discovery separately from actual in-run usage
+- only `simulate_candidate_routes` is eligible for in-planner MCP usage today
+- private submission starts only after a signed raw tx exists
+- audit starts only after a tx hash exists
+- gasless and JIT become planner payload families only after their execution contracts are live
+
+## Success criterion
+
+A viewer should be able to see:
+
+1. how the planner chose a route and execution contract
+2. how private execution is handled outside signing
+3. how execution results are audited after the fact
+4. where gasless and JIT fit in the future stack

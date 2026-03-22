@@ -10,10 +10,16 @@
   "scripts": {
     "dev": "bun --watch packages/core/src/cli/demo.ts",
     "start": "bun packages/core/src/cli/demo.ts",
+    "mcp:execution": "bun packages/execution-mcp/src/index.ts",
+    "diagnose:quotes": "bun packages/core/src/cli/diagnose-quotes.ts",
+    "probe:private": "bun packages/core/src/cli/probe-private-relay.ts",
+    "submit:private": "bun packages/core/src/cli/submit-private.ts",
+    "audit:execution": "bun packages/core/src/cli/audit-execution.ts",
     "web:dev": "cd apps/web && bun run dev",
     "check": "bun ./node_modules/typescript/lib/tsc.js --noEmit -p tsconfig.json && bun ./node_modules/typescript/lib/tsc.js --noEmit -p apps/web/tsconfig.json",
     "test": "bun test packages/core/src",
-    "test:core": "bun test packages/core/src"
+    "test:core": "bun test packages/core/src",
+    "test:contracts": "forge test -C contracts"
   },
   "devDependencies": {
     "@types/bun": "^1.2.12",

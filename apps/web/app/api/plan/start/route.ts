@@ -1,9 +1,15 @@
 import { BnbCapabilityRegistry, streamPlanningSession } from "@bsc-swap-agent-demo/core"
+import { toUserFacingErrorMessage } from "@bsc-swap-agent-demo/shared"
+import { loadRootEnv } from "../../_lib/load-root-env"
+import { replayFixtures, type ReplayFixtureName } from "../../../fixtures/plans"
 
 export async function POST(request: Request) {
+  loadRootEnv()
+
   const body = (await request.json()) as {
     message?: string
     walletAddress?: string
+    fixture?: ReplayFixtureName
   }
 
   if (!body.message) {
@@ -25,10 +31,20 @@ export async function POST(request: Request) {
       }
 
       try {
+        if (body.fixture) {
+          const fixture = replayFixtures[body.fixture]
+          writeEvent("session", { sessionId: fixture.sessionId })
+          for (const event of fixture.events) {
+            writeEvent("planning-event", event)
+          }
+          writeEvent("complete", { sessionId: fixture.sessionId })
+          return
+        }
+
         const planningStream = streamPlanningSession({
           sessionId,
           message: body.message!,
-          walletAddress: body.walletAddress,
+          walletAddress: body.walletAddress || process.env.DEMO_WALLET_ADDRESS,
           network: (process.env.DEMO_NETWORK as "bsc" | "bsc-testnet") || "bsc",
           registry
         })
@@ -41,7 +57,7 @@ export async function POST(request: Request) {
       } catch (error) {
         writeEvent("error", {
           sessionId,
-          error: error instanceof Error ? error.message : "Planning failed."
+          error: error instanceof Error ? toUserFacingErrorMessage(error.message) : "Planning failed."
         })
       } finally {
         await registry.close()

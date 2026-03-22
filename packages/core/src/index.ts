@@ -2,10 +2,18 @@ export { BnbCapabilityRegistry } from "./capabilities/registry"
 export type {
   CapabilityRegistry,
   ChainCapabilityAdapter,
+  MarketIntelligenceAdapter,
   QuoteCapabilityAdapter,
   SubmissionCapabilityAdapter
 } from "./capabilities/types"
-export { formatPlan } from "./format/output"
+export {
+  formatPlan,
+  formatDebugPlan,
+  formatStreamingUpdate,
+  buildPartialPresentationTrace,
+  toPresentationJson,
+  toDebugJson
+} from "./format/output"
 export { continuePlan, planSwap, runPlanningStream } from "./planning/engine"
 export { finalizeDecisionTrace } from "./planning/events"
 export {
@@ -30,6 +38,12 @@ export {
   buildPrivateSubmissionRequest,
   buildPublicTransactionRequest
 } from "./submission/requests"
+export { auditExecution, broadcastPrivateRawTransaction } from "./submission/private-execution"
+export {
+  loadPrivateSubmissionRegistry,
+  probeRegistryEndpointById,
+  selectRegistryEndpoints
+} from "./submission/private-registry"
 export type {
   DecisionTraceField,
   DecisionTraceStage,
@@ -39,5 +53,14 @@ export type {
   PlanningEventKind,
   PlanningEventStatus,
   PlanningResult,
+  PresentationResult,
+  PresentationTraceItem,
+  PartialPresentationTraceItem,
+  PresentationActivityItem,
   PlanningSessionSnapshot
+} from "@bsc-swap-agent-demo/shared"
+export {
+  createPresentationResult,
+  createPartialPresentationTrace,
+  createPresentationActivityFeed
 } from "@bsc-swap-agent-demo/shared"

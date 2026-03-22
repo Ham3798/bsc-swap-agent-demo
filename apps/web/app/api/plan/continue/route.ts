@@ -1,6 +1,10 @@
 import { BnbCapabilityRegistry, streamPlanningContinuation } from "@bsc-swap-agent-demo/core"
+import { toUserFacingErrorMessage } from "@bsc-swap-agent-demo/shared"
+import { loadRootEnv } from "../../_lib/load-root-env"
 
 export async function POST(request: Request) {
+  loadRootEnv()
+
   const body = (await request.json()) as {
     sessionId?: string
     answer?: string
@@ -37,7 +41,7 @@ export async function POST(request: Request) {
       } catch (error) {
         writeEvent("error", {
           sessionId: body.sessionId,
-          error: error instanceof Error ? error.message : "Continuation failed."
+          error: error instanceof Error ? toUserFacingErrorMessage(error.message) : "Continuation failed."
         })
       } finally {
         await registry.close()

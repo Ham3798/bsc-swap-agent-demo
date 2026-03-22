@@ -151,6 +151,16 @@ Rules:
 - do not dump full prompts, calldata, RPC payloads, or quote blobs
 - use only the provided structured inputs
 
+Quota policy:
+
+- stage summaries are an enhancement, not a planner success condition
+- if stage summary generation fails or times out, deterministic reasoning must remain visible
+- when quota is constrained, prefer summarizing only:
+  - `execution-package-comparison`
+  - `path-quality-assessment`
+  - `final-recommendation`
+- lower-priority stage summaries may be skipped without changing the final planner contract
+
 Prompt version:
 
 - `stage-summary-v1`

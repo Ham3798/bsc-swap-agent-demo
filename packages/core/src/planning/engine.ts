@@ -1,6 +1,11 @@
 import type {
   AlternativeRejected,
+  CoverageConfidence,
   DecisionTraceField,
+  ExecutionCapabilityName,
+  ExecutionBoundary,
+  ExecutionCapabilityUsage,
+  ExecutionPackage,
   FollowUpResponse,
   LiquiditySnapshot,
   MevRiskAssessment,
@@ -119,6 +124,52 @@ export async function* runPlanningStream(input: {
   const slippageBps = state.intent.slippageBps ?? 50
 
   yield emit({
+    stage: "execution-family-selection",
+    kind: "stage-started",
+    status: "running",
+    message: "Selecting the execution family for this swap request.",
+    data: {
+      title: "Execution family selection",
+      inputPreview: [
+        { label: "sell_token", value: state.intent.sellToken ?? "unknown" },
+        { label: "buy_token", value: state.intent.buyToken ?? "unknown" },
+        { label: "prefer_private", value: String(state.intent.preferences.preferPrivate ?? false) }
+      ]
+    }
+  })
+  for (const event of await buildStageReasoningEvents({
+    emit,
+    stage: "execution-family-selection",
+    stageSummarizer,
+    deterministicMessage:
+      "Selected execution families to compare: self-executed router paths and delegated solver-intent paths.",
+    deterministicData: {
+      observations: [
+        { label: "self_executed_family", value: "direct-dex and aggregator paths can use router calldata." },
+        { label: "delegated_family", value: "solver-intent and meta-aggregator paths may use approval plus intent handoff." }
+      ],
+      decision:
+        "Compare both self-executed and delegated execution families so the planner can recommend the best overall execution package."
+    },
+    summaryInput: {
+      stage: "execution-family-selection",
+      intent: state.intent,
+      toolObservations: [
+        { label: "self_executed_family", value: "direct-dex and aggregator" },
+        { label: "delegated_family", value: "solver-intent and meta-aggregator" }
+      ]
+    }
+  })) {
+    yield event
+  }
+  yield emit({
+    stage: "execution-family-selection",
+    kind: "stage-completed",
+    status: "completed",
+    message: "Execution family selection completed."
+  })
+
+  yield emit({
     stage: "liquidity-discovery",
     kind: "stage-started",
     status: "running",
@@ -159,6 +210,7 @@ export async function* runPlanningStream(input: {
     data: { toolName: "resolveToken", inputPreview: [{ label: "query", value: state.intent.buyToken ?? "unknown" }] }
   })
   const buyToken = await resolveRequiredToken(input.registry, state.intent.buyToken!, input.context.network)
+  const amountRaw = parseAmountToRaw(state.intent.amount!, sellToken.decimals)
   yield emit({
     stage: "liquidity-discovery",
     kind: "tool-succeeded",
@@ -183,13 +235,38 @@ export async function* runPlanningStream(input: {
       inputPreview: traceTokenInputs(sellToken.symbol, buyToken.symbol, state.intent.amount!)
     }
   })
-  const routeCandidatesRaw = await input.registry.quote.getQuoteCandidates({
-    network: input.context.network,
-    sellToken,
-    buyToken,
-    amount: state.intent.amount!,
-    slippageBps
+  const quoteResult = input.registry.quote.getQuoteCandidatesWithAudit
+    ? await input.registry.quote.getQuoteCandidatesWithAudit({
+        network: input.context.network,
+        sellToken,
+        buyToken,
+        amount: state.intent.amount!,
+        amountRaw,
+        slippageBps
+      })
+    : {
+        candidates: await input.registry.quote.getQuoteCandidates({
+          network: input.context.network,
+          sellToken,
+          buyToken,
+          amount: state.intent.amount!,
+          amountRaw,
+          slippageBps
+        }),
+        audit: [],
+        observedAt: new Date().toISOString()
+      }
+  const routeCandidatesRaw = quoteResult.candidates
+  const quoteFreshness = deriveQuoteFreshness(quoteResult.observedAt)
+  const providerUniverseSnapshot = await input.registry.market.buildCuratedUniverseSnapshot({
+    network: input.context.network
   })
+  const venueCoverageSnapshot = await input.registry.market.getVenueCoverageSnapshot({
+    network: input.context.network,
+    observedDexes: collectObservedDexes(routeCandidatesRaw),
+    pair: { sellToken: sellToken.symbol, buyToken: buyToken.symbol }
+  })
+  const routeCandidatesObserved = applyVenueCoverage(routeCandidatesRaw, venueCoverageSnapshot)
   yield emit({
     stage: "liquidity-discovery",
     kind: "tool-succeeded",
@@ -198,20 +275,49 @@ export async function* runPlanningStream(input: {
     data: {
       toolName: "getQuoteCandidates",
       outputPreview: [
-        { label: "candidate_count", value: String(routeCandidatesRaw.length) },
-        { label: "dominant_venues", value: summarizeDexes(routeCandidatesRaw) }
+        {
+          label: "queried",
+          value: quoteResult.audit.map((item) => `${item.providerId}(${item.mode})`).join(", ")
+        },
+        {
+          label: "seen",
+          value: routeCandidatesObserved
+            .slice(0, 3)
+            .map((candidate) => `${candidate.id} ${candidate.quotedOutFormatted}`)
+            .join(", ")
+        },
+        {
+          label: "drop",
+          value: quoteResult.audit
+            .filter((item) => item.status !== "observed")
+            .map((item) => `${item.providerId} ${item.reason ?? item.status}`)
+            .join(", ")
+        },
+        { label: "candidate_count", value: String(routeCandidatesObserved.length) },
+        { label: "dominant_venues", value: summarizeDexes(routeCandidatesObserved) },
+        {
+          label: "coverage_ratio",
+          value: `${Math.round(venueCoverageSnapshot.coverageRatio * 100)}%`
+        },
+        {
+          label: "curated_aggregators",
+          value: providerUniverseSnapshot.curatedCandidates
+            .filter((candidate) => candidate.category === "aggregator" && candidate.included)
+            .map((candidate) => candidate.displayName)
+            .join(", ")
+        }
       ]
     }
   })
 
-  if (routeCandidatesRaw.length < 2) {
+  if (routeCandidatesObserved.length < 2) {
     yield emit({
       stage: "liquidity-discovery",
       kind: "stage-failed",
       status: "failed",
       message: "Could not gather enough route candidates to explain execution tradeoffs.",
       data: {
-        observations: [{ label: "candidate_count", value: String(routeCandidatesRaw.length) }],
+        observations: [{ label: "candidate_count", value: String(routeCandidatesObserved.length) }],
         decision: "Stop because best-execution comparison needs at least two candidates.",
         error: "Need at least two route candidates to explain best execution tradeoffs."
       }
@@ -227,11 +333,19 @@ export async function* runPlanningStream(input: {
     deterministicData: {
       observations: [
         { label: "quote_source", value: "OpenOcean aggregator APIs" },
-        { label: "candidate_count", value: String(routeCandidatesRaw.length) },
-        { label: "dominant_venues", value: summarizeDexes(routeCandidatesRaw) }
+        { label: "candidate_count", value: String(routeCandidatesObserved.length) },
+        { label: "dominant_venues", value: summarizeDexes(routeCandidatesObserved) },
+        {
+          label: "coverage_ratio",
+          value: `${Math.round(venueCoverageSnapshot.coverageRatio * 100)}%`
+        },
+        {
+          label: "modeled_adapters",
+          value: providerUniverseSnapshot.modeledAdapters.join(", ") || "none"
+        }
       ],
       decision: "Use the candidate set as the basis for execution-quality comparison.",
-      artifacts: routeCandidatesRaw.slice(0, 4).map((candidate) => ({
+      artifacts: routeCandidatesObserved.slice(0, 4).map((candidate) => ({
         label: candidate.id,
         value: candidate.quotedOutFormatted
       }))
@@ -241,10 +355,18 @@ export async function* runPlanningStream(input: {
       intent: state.intent,
       toolObservations: [
         { label: "quote_source", value: "OpenOcean aggregator APIs" },
-        { label: "candidate_count", value: String(routeCandidatesRaw.length) },
-        { label: "dominant_venues", value: summarizeDexes(routeCandidatesRaw) }
+        { label: "candidate_count", value: String(routeCandidatesObserved.length) },
+        { label: "dominant_venues", value: summarizeDexes(routeCandidatesObserved) },
+        {
+          label: "coverage_ratio",
+          value: `${Math.round(venueCoverageSnapshot.coverageRatio * 100)}%`
+        },
+        {
+          label: "modeled_adapters",
+          value: providerUniverseSnapshot.modeledAdapters.join(", ") || "none"
+        }
       ],
-      currentCandidates: routeCandidatesRaw.slice(0, 4)
+      currentCandidates: routeCandidatesObserved.slice(0, 4)
     }
   })) {
     yield event
@@ -266,8 +388,8 @@ export async function* runPlanningStream(input: {
       inputPreview: [{ label: "candidate_ids", value: routeCandidatesRaw.map((route) => route.id).join(", ") }]
     }
   })
-  const mevRiskAssessment = assessMevRisk(routeCandidatesRaw, state.intent)
-  const routeCandidates = scoreRoutes(routeCandidatesRaw, mevRiskAssessment, state.intent)
+  const mevRiskAssessment = assessMevRisk(routeCandidatesObserved, state.intent)
+  const routeCandidates = scoreRoutes(routeCandidatesObserved, mevRiskAssessment, state.intent)
   const recommendedRoute = routeCandidates[0]
   for (const event of await buildStageReasoningEvents({
     emit,
@@ -277,9 +399,12 @@ export async function* runPlanningStream(input: {
     deterministicData: {
       observations: routeCandidates.map((candidate) => ({
         label: candidate.id,
-        value: `score=${candidate.score.toFixed(4)}, impact=${candidate.priceImpactPct.toFixed(3)}%, mev=${candidate.mevExposure}`
+        value: `score=${candidate.score.toFixed(4)}, impact=${candidate.priceImpactPct.toFixed(3)}%, mev=${candidate.mevExposure}, coverage=${candidate.coverageConfidence}`
       })),
-      decision: `Pick ${recommendedRoute.id} as the highest execution-quality route.`,
+      decision: `Keep ${routeCandidates
+        .slice(0, 2)
+        .map((candidate) => candidate.id)
+        .join(", ")} for payload preparation.`,
       artifacts: routeCandidates.slice(1).map((candidate) => ({
         label: candidate.id,
         value: candidate.rejectionReason ?? "lower execution score"
@@ -290,7 +415,7 @@ export async function* runPlanningStream(input: {
       intent: state.intent,
       toolObservations: routeCandidates.map((candidate) => ({
         label: candidate.id,
-        value: `${candidate.quotedOutFormatted}, impact=${candidate.priceImpactPct.toFixed(3)}%, stability=${candidate.expectedExecutionStability}, mev=${candidate.mevExposure}`
+        value: `${candidate.quotedOutFormatted}, impact=${candidate.priceImpactPct.toFixed(3)}%, stability=${candidate.expectedExecutionStability}, mev=${candidate.mevExposure}, coverage=${candidate.coverageConfidence}`
       })),
       currentCandidates: routeCandidates,
       recommendedCandidate: recommendedRoute,
@@ -341,6 +466,7 @@ export async function* runPlanningStream(input: {
       sellToken,
       buyToken,
       amount: state.intent.amount!,
+      amountRaw,
       slippageBps,
       account: input.context.walletAddress
     })
@@ -422,7 +548,10 @@ export async function* runPlanningStream(input: {
     payloadCandidates.push({
       id: `payload-${index + 1}-${candidate.id}`,
       type: "router-calldata",
+      routeFamily: candidate.routeFamily,
       ...encoded,
+      executionMode: "self-executed",
+      approvalRequired: !sellToken.isNative,
       simulation
     })
   }
@@ -459,7 +588,7 @@ export async function* runPlanningStream(input: {
     status: "running",
     message: "Assessing quoted output versus price impact."
   })
-  const priceImpactAssessment = buildPriceImpactAssessment(routeCandidatesRaw)
+  const priceImpactAssessment = buildPriceImpactAssessment(routeCandidates)
   for (const event of await buildStageReasoningEvents({
     emit,
     stage: "price-impact-assessment",
@@ -540,7 +669,7 @@ export async function* runPlanningStream(input: {
   const liquiditySnapshot = buildLiquiditySnapshot({
     sellToken,
     buyToken,
-    routes: routeCandidatesRaw
+    routes: routeCandidates
   })
   const guardrails = buildGuardrails({
     intent: state.intent,
@@ -596,6 +725,47 @@ export async function* runPlanningStream(input: {
     mevRiskLevel: mevRiskAssessment.level,
     preferPrivate: state.intent.preferences.preferPrivate
   })
+  const privatePathRegistrySummary = await input.registry.submission.getPrivatePathRegistrySummary?.({
+    network: input.context.network
+  })
+  const executionCapabilitySummary = await input.registry.submission.getExecutionCapabilitySummary?.({
+    network: input.context.network
+  })
+  const capabilityAvailable = deriveExecutionCapabilityNames(executionCapabilitySummary)
+  const keptRouteIds = routeCandidates
+    .filter((candidate) =>
+      payloadCandidates.some(
+        (payloadCandidate) =>
+          payloadCandidate.platform === candidate.platform && payloadCandidate.routeFamily === candidate.routeFamily
+      )
+    )
+    .map((candidate) => candidate.id)
+  let executionCapabilityUsage: ExecutionCapabilityUsage = {
+    available: capabilityAvailable,
+    used: [],
+    notes: executionCapabilitySummary?.available
+      ? ["route-sim unavailable, local simulation only"]
+      : ["execution-mcp unavailable, local simulation only"]
+  }
+  if (executionCapabilitySummary?.available && executionCapabilitySummary.routeSimulationAvailable) {
+    const amountForRouteSim = typeof state.intent.amount === "string" ? state.intent.amount : String(state.intent.amount ?? "")
+    const routeSimulation = await input.registry.submission.simulateCandidateRoutes?.({
+      network: input.context.network,
+      sellToken,
+      buyToken,
+      amount: amountForRouteSim,
+      slippageBps,
+      account: input.context.walletAddress,
+      routeIds: keptRouteIds
+    })
+    if (routeSimulation) {
+      executionCapabilityUsage = {
+        available: capabilityAvailable,
+        used: routeSimulation.usage.used,
+        notes: routeSimulation.note ? [routeSimulation.note] : routeSimulation.usage.notes
+      }
+    }
+  }
   const recommendedSubmission =
     submissionCandidates.find((candidate) => candidate.recommended) ?? submissionCandidates[0]
   yield emit({
@@ -606,8 +776,17 @@ export async function* runPlanningStream(input: {
     data: {
       toolName: "getSubmissionPaths",
       outputPreview: submissionCandidates.map((candidate) => ({
-        label: candidate.path,
-        value: `${candidate.availability}; recommended=${candidate.recommended}`
+        label:
+          candidate.submissionChannel === "public-mempool"
+            ? "public"
+            : candidate.submissionChannel === "private-rpc"
+              ? "private"
+              : candidate.submissionChannel === "builder-aware-broadcast"
+                ? "builder"
+                : "intent",
+        value: [candidate.liveStatus, candidate.verificationStatus, candidate.sourceType === "registry-backed" ? "registry" : null]
+          .filter(Boolean)
+          .join(" ")
       }))
     }
   })
@@ -650,6 +829,159 @@ export async function* runPlanningStream(input: {
     message: "Submission strategy completed."
   })
 
+  payloadCandidates.push(
+    buildDelegatedIntentPayload({
+      intent: state.intent,
+      route: recommendedRoute
+    })
+  )
+
+  yield emit({
+    stage: "execution-package-construction",
+    kind: "stage-started",
+    status: "running",
+    message: "Constructing execution packages from route, payload, and submission combinations.",
+    data: {
+      title: "Execution package construction",
+      inputPreview: [{ label: "route_count", value: String(routeCandidates.length) }]
+    }
+  })
+  const executionPackages = buildExecutionPackages({
+    intent: state.intent,
+    routeCandidates,
+    payloadCandidates,
+    submissionCandidates
+  })
+  for (const event of await buildStageReasoningEvents({
+    emit,
+    stage: "execution-package-construction",
+    stageSummarizer,
+    deterministicMessage:
+      "Built execution packages that combine route family, payload type, submission channel, and delegation mode.",
+    deterministicData: {
+      observations: executionPackages.map((pkg) => ({
+        label: pkg.id,
+        value: `${pkg.routeFamily}, ${pkg.payloadType}, ${pkg.submissionProvider}, ${pkg.executionMode}`
+      })),
+      decision: "Compare full execution packages instead of treating route choice and submission choice as separate decisions."
+    },
+    summaryInput: {
+      stage: "execution-package-construction",
+      intent: state.intent,
+      toolObservations: executionPackages.map((pkg) => ({
+        label: pkg.id,
+        value: `${pkg.routeProvider}, ${pkg.submissionProvider}, ${pkg.executionMode}`
+      }))
+    }
+  })) {
+    yield event
+  }
+  yield emit({
+    stage: "execution-package-construction",
+    kind: "stage-completed",
+    status: "completed",
+    message: "Execution package construction completed."
+  })
+
+  const bestPricePackage =
+    executionPackages.reduce((best, candidate) => {
+      const currentBestRoute = routeCandidates.find((route) => route.id === best.routeId)
+      const nextRoute = routeCandidates.find((route) => route.id === candidate.routeId)
+      if (!currentBestRoute || !nextRoute) {
+        return best
+      }
+      return BigInt(nextRoute.quotedOut) > BigInt(currentBestRoute.quotedOut) ? candidate : best
+    }, executionPackages[0])
+  const bestExecutionPackage = executionPackages.reduce((best, candidate) =>
+    candidate.score > best.score ? candidate : best
+  , executionPackages[0])
+
+  yield emit({
+    stage: "execution-package-comparison",
+    kind: "stage-started",
+    status: "running",
+    message: "Comparing execution packages across self-executed and delegated paths.",
+    data: {
+      title: "Execution package comparison",
+      inputPreview: [{ label: "package_count", value: String(executionPackages.length) }]
+    }
+  })
+  for (const event of await buildStageReasoningEvents({
+    emit,
+    stage: "execution-package-comparison",
+    stageSummarizer,
+    deterministicMessage:
+      "Compared execution packages across route family, payload type, submission channel, and delegation boundary.",
+    deterministicData: {
+      observations: executionPackages.map((pkg) => ({
+        label: pkg.id,
+        value: `score=${pkg.score.toFixed(3)}, mode=${pkg.executionMode}, provider=${pkg.submissionProvider}`
+      })),
+      decision: `Choose ${bestExecutionPackage.id} as the best execution package while tracking ${bestPricePackage.id} as the best price package.`
+    },
+    summaryInput: {
+      stage: "execution-package-comparison",
+      intent: state.intent,
+      toolObservations: executionPackages.map((pkg) => ({
+        label: pkg.id,
+        value: `score=${pkg.score.toFixed(3)}, route=${pkg.routeProvider}, submission=${pkg.submissionProvider}`
+      }))
+    }
+  })) {
+    yield event
+  }
+  yield emit({
+    stage: "execution-package-comparison",
+    kind: "stage-completed",
+    status: "completed",
+    message: "Execution package comparison completed."
+  })
+
+  yield emit({
+    stage: "path-quality-assessment",
+    kind: "stage-started",
+    status: "running",
+    message: "Assessing path quality, delegation boundaries, and approval overhead.",
+    data: { title: "Path quality assessment" }
+  })
+  for (const event of await buildStageReasoningEvents({
+    emit,
+    stage: "path-quality-assessment",
+    stageSummarizer,
+    deterministicMessage:
+      "Assessed path quality by balancing route quality, submission quality, approval overhead, and delegation tradeoffs.",
+    deterministicData: {
+      observations: [
+        { label: "best_price_package", value: bestPricePackage.id },
+        { label: "best_execution_package", value: bestExecutionPackage.id },
+        { label: "execution_mode", value: bestExecutionPackage.executionMode },
+        { label: "delegation_boundary", value: bestExecutionPackage.plannerControlLevel }
+      ],
+      decision:
+        bestPricePackage.id === bestExecutionPackage.id
+          ? "Best price and best execution align for this swap."
+          : "Best price does not win outright because submission channel, delegation shape, and approval overhead change execution quality."
+    },
+    summaryInput: {
+      stage: "path-quality-assessment",
+      intent: state.intent,
+      toolObservations: [
+        { label: "best_price_package", value: bestPricePackage.id },
+        { label: "best_execution_package", value: bestExecutionPackage.id },
+        { label: "execution_mode", value: bestExecutionPackage.executionMode },
+        { label: "submission_provider", value: bestExecutionPackage.submissionProvider }
+      ]
+    }
+  })) {
+    yield event
+  }
+  yield emit({
+    stage: "path-quality-assessment",
+    kind: "stage-completed",
+    status: "completed",
+    message: "Path quality assessment completed."
+  })
+
   const alternativesRejected = routeCandidates.slice(1).map((candidate) => ({
     routeId: candidate.id,
     reason:
@@ -667,14 +999,15 @@ export async function* runPlanningStream(input: {
     emit,
     stage: "final-recommendation",
     stageSummarizer,
-    deterministicMessage: "Combined route, payload, submission path, and guardrails into the final execution plan.",
+    deterministicMessage: "Combined route, payload, submission path, delegation mode, and guardrails into the final execution plan.",
     deterministicData: {
       observations: [
-        { label: "route", value: recommendedRoute.id },
-        { label: "payload", value: payload.id },
-        { label: "submission", value: recommendedSubmission.path }
+        { label: "best_price_package", value: bestPricePackage.id },
+        { label: "best_execution_package", value: bestExecutionPackage.id },
+        { label: "execution_mode", value: bestExecutionPackage.executionMode },
+        { label: "submission_provider", value: bestExecutionPackage.submissionProvider }
       ],
-      decision: `Recommend ${recommendedRoute.id} with ${recommendedSubmission.path} as the best execution plan.`,
+      decision: `Recommend ${bestExecutionPackage.id} as the best execution package for this swap.`,
       artifacts: alternativesRejected.map((candidate) => ({
         label: candidate.routeId,
         value: candidate.reason
@@ -684,9 +1017,10 @@ export async function* runPlanningStream(input: {
       stage: "final-recommendation",
       intent: state.intent,
       toolObservations: [
-        { label: "route", value: recommendedRoute.id },
-        { label: "payload", value: payload.id },
-        { label: "submission", value: recommendedSubmission.path }
+        { label: "best_price_package", value: bestPricePackage.id },
+        { label: "best_execution_package", value: bestExecutionPackage.id },
+        { label: "execution_mode", value: bestExecutionPackage.executionMode },
+        { label: "submission_provider", value: bestExecutionPackage.submissionProvider }
       ],
       recommendedCandidate: recommendedRoute,
       rejectedCandidates: alternativesRejected.map((candidate) => ({
@@ -720,27 +1054,100 @@ export async function* runPlanningStream(input: {
       missingFieldsResolved: state.missingFieldsResolved,
       decisionTrace: [],
       liquiditySnapshot,
+      venueCoverageSnapshot,
+      providerUniverseSnapshot,
       routeCandidates,
+      quoteProviderAudit: quoteResult.audit,
+      quoteObservedAt: quoteResult.observedAt,
+      quoteFreshness,
+      executionPackages,
       priceImpactAssessment,
+      bestObservedQuoteConfidence: deriveBestObservedQuoteConfidence(routeCandidates, priceImpactAssessment),
       mevRiskAssessment,
       payloadCandidates,
       submissionCandidates,
+      privatePathRegistrySummary,
+      executionCapabilitySummary,
+      executionCapabilityUsage,
       guardrails,
+      executionBoundary: buildExecutionBoundary(bestExecutionPackage),
       recommendedPlan: {
-        routeId: recommendedRoute.id,
-        payloadId: payload.id,
-        submissionPath: recommendedSubmission.path,
+        routeId: bestExecutionPackage.routeId,
+        payloadId: bestExecutionPackage.payloadId,
+        submissionPath: bestExecutionPackage.submissionPath,
+        executionPackageId: bestExecutionPackage.id,
+        bestPricePackageId: bestPricePackage.id,
+        bestExecutionPackageId: bestExecutionPackage.id,
+        executionMode: bestExecutionPackage.executionMode,
+        submissionChannel: bestExecutionPackage.submissionChannel,
+        submissionProvider: bestExecutionPackage.submissionProvider,
         expectedOut: recommendedRoute.quotedOutFormatted,
         summary:
-          `Recommended ${recommendedRoute.platform} because it offers the strongest execution-quality score, not just the highest nominal quote. ` +
-          `The route balances output, impact (${recommendedRoute.priceImpactPct.toFixed(3)}%), and MEV-aware submission preferences.`,
+          `Recommended ${bestExecutionPackage.routeProvider} via ${bestExecutionPackage.submissionProvider} because it offers the strongest overall execution package, not just the best observed quote among the current adapters. ` +
+          `This package balances route quality, path quality, delegation shape, and approval overhead for the current swap.`,
         riskNote:
-          recommendedSubmission.path === "public-mempool"
-            ? "Public submission keeps availability high but exposes the swap to extraction risk."
-            : "Private or builder-aware paths are still advisory in this stage, but they better match the MEV sensitivity of the swap.",
+          bestExecutionPackage.submissionChannel === "public-mempool"
+            ? "Public submission remains directly executable, but it carries a weaker path-quality profile than builder-friendly alternatives."
+            : [
+                `${bestExecutionPackage.submissionProvider} is recommended as a builder-friendly choice, but some execution outcomes remain outside the planner's direct control.`,
+                venueCoverageSnapshot.missingHighShareVenues.length
+                  ? `Market coverage is still partial because some high-share BSC venues were not clearly observed: ${venueCoverageSnapshot.missingHighShareVenues.slice(0, 3).join(", ")}.`
+                  : null
+              ]
+                .filter(Boolean)
+                .join(" "),
         policyNote:
-          "Simulation, slippage bounds, deadline, and stale-quote checks remain mandatory before any live submission."
+          bestExecutionPackage.executionMode === "self-executed"
+            ? "Simulation, slippage bounds, deadline, and stale-quote checks remain mandatory before live self-execution."
+            : "Approval policy, handoff requirements, and quote freshness remain mandatory before any delegated execution path."
       },
+      observedRouteIds: routeCandidates.map((candidate) => candidate.id),
+      defaultSelectedRouteId: routeCandidates[0]?.id ?? bestExecutionPackage.routeId,
+      effectiveSlippageBps: slippageBps,
+      executionReadyNow:
+        quoteFreshness === "fresh" &&
+        routeCandidates.some((candidate) =>
+          payloadCandidates.some(
+            (payloadCandidate) =>
+              payloadCandidate.platform === candidate.platform &&
+              payloadCandidate.routeFamily === candidate.routeFamily &&
+              payloadCandidate.simulation.ok
+          )
+        ) &&
+        submissionCandidates.some(
+          (submission) => submission.submissionChannel === "public-mempool" && submission.liveStatus === "live"
+        ),
+      bestQuoteRouteId: priceImpactAssessment.bestQuotedRouteId,
+      bestReadyRouteId: routeCandidates.find((candidate) =>
+        payloadCandidates.some(
+          (payloadCandidate) =>
+            payloadCandidate.platform === candidate.platform &&
+            payloadCandidate.routeFamily === candidate.routeFamily &&
+            payloadCandidate.simulation.ok
+        )
+      )?.id ?? null,
+      routeExecutionReadiness: routeCandidates.map((candidate) => {
+        const payloadCandidate = payloadCandidates.find(
+          (payload) => payload.platform === candidate.platform && payload.routeFamily === candidate.routeFamily
+        )
+        const simulationOk = payloadCandidate?.simulation.ok ?? false
+        return {
+          routeId: candidate.id,
+          payloadReady: Boolean(payloadCandidate),
+          simulationOk,
+          liveExecutable: Boolean(
+            payloadCandidate &&
+              simulationOk &&
+              payloadCandidate.executionMode === "self-executed" &&
+              submissionCandidates.some(
+                (submission) =>
+                  submission.submissionChannel === "public-mempool" &&
+                  submission.liveStatus === "live" &&
+                  submission.routeFamilies.includes(candidate.routeFamily)
+              )
+          )
+        }
+      }),
       alternativesRejected
     }
   })
@@ -802,6 +1209,34 @@ export async function planSwap(input: {
     kind: "plan",
     result: finalResult
   }
+}
+
+function deriveQuoteFreshness(observedAt: string): "fresh" | "stale" {
+  const ageMs = Date.now() - Date.parse(observedAt)
+  return Number.isFinite(ageMs) && ageMs > 20_000 ? "stale" : "fresh"
+}
+
+function parseAmountToRaw(amount: string, decimals: number): string {
+  const normalizedAmount = String(amount ?? "").trim()
+  const [wholePart, fractionalPart = ""] = normalizedAmount.split(".")
+  const normalizedWhole = wholePart === "" ? "0" : wholePart
+  const normalizedFraction = fractionalPart.replace(/[^0-9]/g, "").slice(0, decimals).padEnd(decimals, "0")
+  return `${normalizedWhole}${normalizedFraction}`.replace(/^0+(?=\d)/, "") || "0"
+}
+
+function deriveExecutionCapabilityNames(
+  summary?: PlanningResult["executionCapabilitySummary"]
+): ExecutionCapabilityName[] {
+  if (!summary?.available) {
+    return []
+  }
+
+  return [
+    summary.privateSubmitAvailable ? "private-submit" : null,
+    summary.builderBroadcastAvailable ? "builder-broadcast" : null,
+    summary.auditAvailable ? "audit" : null,
+    summary.routeSimulationAvailable ? "route-sim" : null
+  ].filter(Boolean) as ExecutionCapabilityName[]
 }
 
 export function continuePlan(sessionState: PlanningSessionState, userAnswer: string): PlanningSessionState {
@@ -1068,8 +1503,12 @@ async function buildStageReasoningEvents(input: {
 
 function shouldUseLlmSummary(stage: PlanningEvent["stage"]): boolean {
   return (
+    stage === "execution-family-selection" ||
     stage === "liquidity-discovery" ||
     stage === "route-comparison" ||
+    stage === "execution-package-construction" ||
+    stage === "execution-package-comparison" ||
+    stage === "path-quality-assessment" ||
     stage === "price-impact-assessment" ||
     stage === "mev-risk-assessment" ||
     stage === "submission-strategy" ||
@@ -1099,6 +1538,11 @@ function assessMevRisk(routes: RouteCandidate[], intent: StructuredIntent): MevR
   const maxImpact = Math.max(...routes.map((route) => route.priceImpactPct))
   const fragmented = routes.some((route) => route.dexes.length >= 3)
   const preferPrivate = intent.preferences.preferPrivate === true
+  const riskDrivers = [
+    ...(fragmented ? ["route fragmentation"] : []),
+    ...(maxImpact > 0.5 ? ["price impact sensitivity"] : []),
+    ...(preferPrivate ? ["user prefers private or builder-friendly delivery"] : [])
+  ]
   const level: MevRiskAssessment["level"] =
     preferPrivate || maxImpact > 1 || fragmented ? "high" : maxImpact > 0.3 ? "medium" : "low"
 
@@ -1110,7 +1554,10 @@ function assessMevRisk(routes: RouteCandidate[], intent: StructuredIntent): MevR
         : "The swap is still MEV-exposed on public paths, but the trade size and route fragmentation suggest a more moderate risk profile.",
     publicPathRisk:
       "A public path may make the quoted route look better than the realized execution if searchers can react before inclusion.",
-    preferredSubmission: level === "high" ? "private-rpc" : "public-mempool"
+    preferredSubmission: level === "high" ? "private-rpc" : "public-mempool",
+    riskDrivers,
+    preferredSubmissionFamily:
+      level === "high" ? "private-rpc" : "public-mempool"
   }
 }
 
@@ -1145,9 +1592,15 @@ function scoreRoutes(
               ? 0.08
               : 0.02
           : 0
+      const coverageAdjustment =
+        candidate.coverageConfidence === "high"
+          ? 0.03
+          : candidate.coverageConfidence === "medium"
+            ? 0
+            : -0.04
       return {
         ...candidate,
-        score: quoteScore + stabilityBoost - impactPenalty - mevPenalty
+        score: quoteScore + stabilityBoost - impactPenalty - mevPenalty + coverageAdjustment
       }
     })
     .sort((a, b) => b.score - a.score)
@@ -1181,11 +1634,260 @@ function buildPriceImpactAssessment(routes: RouteCandidate[]): PriceImpactAssess
   return {
     bestQuotedRouteId: bestQuoted.id,
     lowestImpactRouteId: lowestImpact.id,
+    bestExecutionRouteId: lowestImpact.id,
     commentary:
       bestQuoted.id === lowestImpact.id
-        ? "The best quote also has the lowest measured price impact, so quoted price and execution quality align."
-        : "The best quote is not the lowest-impact route, so realized execution may favor a slightly weaker quote with more stable price impact."
+        ? "The best observed quote also has the lowest measured price impact, so observed quote quality and execution quality align."
+        : "The best observed quote is not the lowest-impact route, so realized execution may favor a slightly weaker observed quote with more stable price impact."
   }
+}
+
+function buildDelegatedIntentPayload(input: {
+  intent: StructuredIntent
+  route: RouteCandidate
+}): PayloadCandidate {
+  return {
+    id: `payload-intent-${input.route.id}`,
+    type: "approval-plus-intent",
+    platform: "CoW-style intent path",
+    routeFamily: "solver-intent",
+    to: "intent-server://cow-style",
+    data: JSON.stringify({
+      sellToken: input.intent.sellToken,
+      buyToken: input.intent.buyToken,
+      amount: input.intent.amount
+    }),
+    value: "0",
+    minOutAmount: input.route.quotedOut,
+    estimatedGas: "0",
+    executionMode: "delegated-to-solver",
+    approvalRequired: true,
+    simulation: {
+      ok: true,
+      estimatedGas: "0",
+      note: "Delegated intent handoff does not simulate as direct router calldata in the current stage."
+    }
+  }
+}
+
+function buildExecutionPackages(input: {
+  intent: StructuredIntent
+  routeCandidates: RouteCandidate[]
+  payloadCandidates: PayloadCandidate[]
+  submissionCandidates: import("@bsc-swap-agent-demo/shared").SubmissionCandidate[]
+}): ExecutionPackage[] {
+  const packages: ExecutionPackage[] = []
+
+  for (const route of input.routeCandidates) {
+    const payload = input.payloadCandidates.find(
+      (candidate) =>
+        candidate.platform === route.platform && candidate.routeFamily === route.routeFamily
+    )
+    if (!payload) continue
+
+    for (const submission of input.submissionCandidates.filter((candidate) =>
+      candidate.routeFamilies.includes(route.routeFamily)
+    )) {
+      packages.push({
+        id: `${route.id}-${submission.submissionChannel}`,
+        routeId: route.id,
+        routeProvider: route.platform,
+        routeFamily: route.routeFamily,
+        payloadId: payload.id,
+        payloadType: payload.type,
+        submissionPath: submission.path,
+        submissionChannel: submission.submissionChannel,
+        submissionProvider: submission.providerName,
+        executionMode: payload.executionMode,
+        approvalRequired: payload.approvalRequired ?? false,
+        approvalPolicy: payload.approvalRequired
+          ? "User approval is required before delegated handoff."
+          : "No extra approval beyond the direct transaction payload.",
+        trustAssumptions: [submission.trustAssumption],
+        plannerControlLevel: submission.plannerControlLevel,
+        quoteQuality: route.priceImpactPct < 0.2 ? "high" : route.priceImpactPct < 0.7 ? "medium" : "low",
+        realizedExecutionConfidence:
+          submission.submissionChannel === "public-mempool" ? "medium" : "high",
+        slippageStability: route.expectedExecutionStability,
+        latencyExpectation: submission.expectedLatency,
+        inclusionPathQuality: submission.expectedInclusionQuality,
+        operationalSimplicity:
+          payload.executionMode === "self-executed" ? "high" : "medium",
+        approvalOverhead:
+          payload.approvalRequired ? "medium" : "low",
+        trustAssumptionCost:
+          submission.plannerControlLevel === "informational" ? "high" : "medium",
+        publicExposure: submission.attackSurface,
+        delegationSuitability:
+          payload.executionMode === "self-executed" ? "medium" : "high",
+        score: scoreExecutionPackage(route, payload, submission),
+        liveStatus: submission.liveStatus,
+        rationale:
+          payload.executionMode === "self-executed"
+            ? `${submission.providerName} keeps the flow self-executed while changing path quality.`
+            : `${submission.providerName} delegates settlement to an external executor and turns the user flow into approval plus intent handoff.`
+      })
+    }
+  }
+
+  const delegatedPayload = input.payloadCandidates.find((candidate) => candidate.type === "approval-plus-intent")
+  const bestRoute = input.routeCandidates[0]
+  const intentSubmission = input.submissionCandidates.find(
+    (candidate) => candidate.submissionChannel === "centralized-intent-server"
+  )
+  if (delegatedPayload && bestRoute && intentSubmission) {
+    packages.push({
+      id: `cow-style-intent-${intentSubmission.submissionChannel}`,
+      routeId: bestRoute.id,
+      routeProvider: "CoW-style intent path",
+      routeFamily: "solver-intent",
+      payloadId: delegatedPayload.id,
+      payloadType: delegatedPayload.type,
+      submissionPath: intentSubmission.path,
+      submissionChannel: intentSubmission.submissionChannel,
+      submissionProvider: intentSubmission.providerName,
+      executionMode: "delegated-to-solver",
+      approvalRequired: true,
+      approvalPolicy: "User must approve token spend and submit the delegated intent.",
+      trustAssumptions: [intentSubmission.trustAssumption],
+      plannerControlLevel: intentSubmission.plannerControlLevel,
+      quoteQuality: "medium",
+      realizedExecutionConfidence: "medium",
+      slippageStability: "medium",
+      latencyExpectation: intentSubmission.expectedLatency,
+      inclusionPathQuality: intentSubmission.expectedInclusionQuality,
+      operationalSimplicity: "medium",
+      approvalOverhead: "medium",
+      trustAssumptionCost: "high",
+      publicExposure: "low",
+      delegationSuitability: "high",
+      score:
+        scoreExecutionPackage(bestRoute, delegatedPayload, intentSubmission) + 0.04,
+      liveStatus: intentSubmission.liveStatus,
+      rationale:
+        "This advisory package delegates execution to a solver and reduces public-path dependence, but it adds trust and approval overhead."
+    })
+  }
+
+  return packages.sort((a, b) => b.score - a.score)
+}
+
+function scoreExecutionPackage(
+  route: RouteCandidate,
+  payload: PayloadCandidate,
+  submission: import("@bsc-swap-agent-demo/shared").SubmissionCandidate
+): number {
+  const routeScore = route.score
+  const privacyBoost =
+    submission.expectedPrivacy === "high" ? 0.08 : submission.expectedPrivacy === "medium" ? 0.03 : -0.03
+  const inclusionBoost =
+    submission.expectedInclusionQuality === "high"
+      ? 0.08
+      : submission.expectedInclusionQuality === "medium"
+        ? 0.03
+        : -0.02
+  const attackPenalty =
+    submission.attackSurface === "high" ? 0.09 : submission.attackSurface === "medium" ? 0.04 : 0.01
+  const approvalPenalty = payload.approvalRequired ? 0.03 : 0
+  const trustPenalty =
+    submission.plannerControlLevel === "informational"
+      ? 0.05
+      : submission.plannerControlLevel === "handoff"
+        ? 0.02
+        : 0
+  return routeScore + privacyBoost + inclusionBoost - attackPenalty - approvalPenalty - trustPenalty
+}
+
+function buildExecutionBoundary(input: ExecutionPackage): ExecutionBoundary {
+  if (input.executionMode === "self-executed") {
+    return {
+      plannerControls: [
+        "intent parsing",
+        "route ranking",
+        "payload construction",
+        "simulation",
+        "guardrail recommendation"
+      ],
+      userSigns: ["transaction signature"],
+      externalExecutorControls: [
+        `${input.submissionProvider} delivery semantics`,
+        "final block inclusion outcome"
+      ]
+    }
+  }
+
+  return {
+    plannerControls: [
+      "intent parsing",
+      "execution package recommendation",
+      "approval policy recommendation",
+      "guardrail recommendation"
+    ],
+    userSigns: ["token approval", "intent submission or handoff authorization"],
+    externalExecutorControls: [
+      `${input.submissionProvider} settlement logic`,
+      "solver or server-side execution outcome",
+      "final block inclusion outcome"
+    ]
+  }
+}
+
+function applyVenueCoverage(
+  routes: RouteCandidate[],
+  venueCoverageSnapshot: import("@bsc-swap-agent-demo/shared").VenueCoverageSnapshot
+): RouteCandidate[] {
+  return routes.map((route) => {
+    const routeMatches = route.dexes.filter((dex) =>
+      venueCoverageSnapshot.topDexesObservedByDefiLlama.some(
+        (topDex) => normalizeVenueName(topDex) === normalizeVenueName(dex.dexCode)
+      )
+    ).length
+
+    const coverageConfidence = deriveCoverageConfidence({
+      routeMatches,
+      snapshotCoverageRatio: venueCoverageSnapshot.coverageRatio,
+      intelligenceAvailable: venueCoverageSnapshot.topDexesObservedByDefiLlama.length > 0
+    })
+
+    return {
+      ...route,
+      coverageConfidence,
+      coverageNotes: [
+        ...(route.coverageNotes ?? []),
+        route.providerNative
+          ? `Quote provenance: native ${route.quoteSource} path via ${route.quoteMethod}.`
+          : `Quote provenance: ${route.platform} is modeled through ${route.quoteSource} via ${route.quoteMethod}.`,
+        venueCoverageSnapshot.missingHighShareVenues.length
+          ? `High-share venues not clearly observed: ${venueCoverageSnapshot.missingHighShareVenues.slice(0, 3).join(", ")}.`
+          : "Current observed set covers the main BSC venues surfaced by market intelligence."
+      ]
+    }
+  })
+}
+
+function deriveCoverageConfidence(input: {
+  routeMatches: number
+  snapshotCoverageRatio: number
+  intelligenceAvailable: boolean
+}): CoverageConfidence {
+  if (!input.intelligenceAvailable) {
+    return "medium"
+  }
+  if (input.routeMatches >= 2 || (input.routeMatches >= 1 && input.snapshotCoverageRatio >= 0.6)) {
+    return "high"
+  }
+  if (input.routeMatches >= 1 || input.snapshotCoverageRatio >= 0.35) {
+    return "medium"
+  }
+  return "low"
+}
+
+function deriveBestObservedQuoteConfidence(
+  routes: RouteCandidate[],
+  priceImpactAssessment: PriceImpactAssessment
+): CoverageConfidence {
+  const bestQuotedRoute = routes.find((route) => route.id === priceImpactAssessment.bestQuotedRouteId)
+  return bestQuotedRoute?.coverageConfidence ?? "medium"
 }
 
 function buildLiquiditySnapshot(input: {
@@ -1245,4 +1947,21 @@ function summarizeDexes(candidates: RouteCandidate[]) {
     .slice(0, 5)
     .map(([dexCode]) => dexCode)
     .join(", ")
+}
+
+function collectObservedDexes(routes: RouteCandidate[]): string[] {
+  return [...new Set(routes.flatMap((route) => route.dexes.map((dex) => dex.dexCode)))]
+}
+
+function normalizeVenueName(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "")
+    .replace(/^pancakeswap/, "pancake")
+    .replace(/^pancake/, "pancake")
+    .replace(/^thenafusion/, "thena")
+    .replace(/^woofiv\d+/i, "woofi")
+    .replace(/^woofi/, "woofi")
+    .replace(/^uniswapv\d+/i, "uniswap")
+    .replace(/^uniswap/, "uniswap")
 }

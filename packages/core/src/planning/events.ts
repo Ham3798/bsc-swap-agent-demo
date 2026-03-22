@@ -31,13 +31,17 @@ export function finalizeDecisionTrace(events: PlanningEvent[]): DecisionTraceSte
   const stageOrder: DecisionTraceStage[] = [
     "intent-parsing",
     "missing-field-resolution",
+    "execution-family-selection",
     "liquidity-discovery",
     "route-comparison",
+    "payload-construction",
     "price-impact-assessment",
     "mev-risk-assessment",
-    "payload-construction",
-    "guardrail-application",
     "submission-strategy",
+    "execution-package-construction",
+    "execution-package-comparison",
+    "path-quality-assessment",
+    "guardrail-application",
     "final-recommendation"
   ]
 
