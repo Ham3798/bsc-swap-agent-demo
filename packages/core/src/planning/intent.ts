@@ -19,8 +19,40 @@ export function hydratePlanningState(
     partialEvents?: PlanningEvent[]
   },
   rawInput: string,
-  userAnswer: string
+  userAnswer: string,
+  missingField?: UnknownField
 ): PlanningSessionState {
+  if (missingField === "sell_token" || missingField === "buy_token") {
+    const normalizedToken = userAnswer.trim().toUpperCase()
+    if (!normalizedToken) {
+      return {
+        rawInput,
+        intent: response.intent,
+        missingFieldsResolved: response.missingFieldsResolved,
+        events: response.partialEvents ?? []
+      }
+    }
+
+    return {
+      rawInput,
+      intent: {
+        ...response.intent,
+        sellToken: missingField === "sell_token" ? normalizedToken : response.intent.sellToken,
+        buyToken: missingField === "buy_token" ? normalizedToken : response.intent.buyToken,
+        unknowns: response.intent.unknowns.filter((item) => item !== missingField)
+      },
+      missingFieldsResolved: [
+        ...response.missingFieldsResolved,
+        {
+          field: missingField,
+          value: normalizedToken,
+          source: "user"
+        }
+      ],
+      events: response.partialEvents ?? []
+    }
+  }
+
   const amountMatch = userAnswer.match(/(\d+(?:\.\d+)?)/)
   if (!amountMatch) {
     return {

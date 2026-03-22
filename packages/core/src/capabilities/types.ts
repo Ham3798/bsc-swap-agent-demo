@@ -12,6 +12,15 @@ import type {
   VenueCoverageSnapshot
 } from "@bsc-swap-agent-demo/shared"
 
+export type TokenResolvedBy = "exact-symbol" | "exact-address" | "alias" | "name-match" | "unresolved"
+
+export interface TokenResolutionResult {
+  resolvedToken: TokenRef | null
+  resolvedBy: TokenResolvedBy
+  normalizedQuery: string
+  suggestions: TokenRef[]
+}
+
 export interface ChainCapabilityAdapter {
   listTools(): Promise<string[]>
   getChainInfo(network: Network): Promise<unknown>
@@ -26,6 +35,7 @@ export interface ChainCapabilityAdapter {
   ): Promise<{ formatted: string; raw: string; symbol?: string }>
   getErc20TokenInfo(tokenAddress: string, network: Network): Promise<unknown>
   resolveToken(query: string, network: Network): Promise<TokenRef | null>
+  resolveTokenDetailed?(query: string, network: Network): Promise<TokenResolutionResult>
   estimateGas(input: {
     network: Network
     to: string

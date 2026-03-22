@@ -46,7 +46,11 @@ export async function auditExecution(input: {
   buyTokenAddress?: `0x${string}`
   recipient?: `0x${string}`
   expectedOut?: string
+  expectedQuoteOut?: string
+  protectedMinOut?: string
   submittedAt?: string | number | Date
+  submittedBlockNumber?: bigint | number | string
+  inclusionWallClockMs?: number
   executionPath?: ExecutionAudit["executionPath"]
 }): Promise<ExecutionAudit> {
   const client = createRpcClient(input.network)
@@ -69,8 +73,14 @@ export async function auditExecution(input: {
 
   const block = await client.getBlock({ blockNumber: receipt.blockNumber }).catch(() => null)
   const submittedAtMs = toTimestamp(input.submittedAt)
-  const inclusionLatencyMs =
+  const chainTimestampDeltaMs =
     submittedAtMs && block?.timestamp ? Number(block.timestamp) * 1000 - submittedAtMs : undefined
+  const submittedBlockNumber =
+    input.submittedBlockNumber == null
+      ? undefined
+      : typeof input.submittedBlockNumber === "bigint"
+        ? input.submittedBlockNumber
+        : BigInt(input.submittedBlockNumber)
 
   const realizedOut =
     input.buyTokenAddress && input.recipient
@@ -86,16 +96,28 @@ export async function auditExecution(input: {
     txHash: input.txHash,
     chainId,
     blockNumber: receipt.blockNumber,
+    inclusionBlockDelta:
+      submittedBlockNumber != null ? Number(receipt.blockNumber - submittedBlockNumber) : undefined,
     status: receipt.status === "success" ? "success" : "reverted",
     gasUsed: receipt.gasUsed,
     effectiveGasPrice: receipt.effectiveGasPrice,
-    inclusionLatencyMs,
+    inclusionLatencyMs: input.inclusionWallClockMs,
+    inclusionWallClockMs: input.inclusionWallClockMs,
+    chainTimestampDeltaMs,
     buyTokenAddress: input.buyTokenAddress,
     recipient: input.recipient,
     expectedOut: input.expectedOut,
+    expectedQuoteOut: input.expectedQuoteOut ?? input.expectedOut,
+    protectedMinOut: input.protectedMinOut,
     realizedOut,
     realizedDelta:
       realizedOut && input.expectedOut ? (BigInt(realizedOut) - BigInt(input.expectedOut)).toString() : undefined,
+    quoteDeltaRaw:
+      realizedOut && (input.expectedQuoteOut ?? input.expectedOut)
+        ? (BigInt(realizedOut) - BigInt(input.expectedQuoteOut ?? input.expectedOut!)).toString()
+        : undefined,
+    minOutDeltaRaw:
+      realizedOut && input.protectedMinOut ? (BigInt(realizedOut) - BigInt(input.protectedMinOut)).toString() : undefined,
     executionPath: input.executionPath ?? "unknown"
   }
 }

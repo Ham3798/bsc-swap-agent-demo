@@ -883,8 +883,8 @@ export default function HomePage() {
             {plan ? (
               <div style={{ display: "grid", gap: 8 }}>
                 <SummaryRow label="Summary" value={presentation?.boundarySummary ?? ""} />
-                <SummaryRow label="Submission" value={presentation?.submissionSummary ?? ""} />
-                <SummaryRow label="Execution MCP" value={presentation?.executionCapabilitySummary ?? ""} />
+                <SummaryRow label="Live path" value={presentation?.submissionSummary ?? ""} />
+                <SummaryRow label="Execution ops available" value={presentation?.executionCapabilitySummary ?? ""} />
                 <SummaryRow label="Used in this run" value={presentation?.executionCapabilityUsageSummary ?? ""} />
               </div>
             ) : null}

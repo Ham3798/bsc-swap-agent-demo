@@ -6,6 +6,7 @@ Use this skill to plan one BSC swap from natural language.
 
 - parse swap intent
 - resolve token metadata
+- normalize obvious BSC token aliases from natural language
 - observe live quotes
 - compare route and submission candidates
 - build payload candidates
@@ -51,6 +52,8 @@ Must surface:
 - public wallet handoff is the main live path
 - execution capability discovery is visible in planner output
 - only `simulate_candidate_routes` can be used inside the planner path today
+- obvious protocol-token aliases auto-resolve through a small deterministic BSC alias layer
+- ambiguous token phrases trigger a follow-up instead of fuzzy auto-selection
 - private submission is surfaced as a handoff contract, not as planner-owned signing
 - private execution ops remain outside the planner signing path
 - gasless and JIT payload families are not the default planner path yet

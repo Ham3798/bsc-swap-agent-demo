@@ -4,7 +4,9 @@ import { config as loadEnv } from "dotenv"
 import { toUserFacingErrorMessage } from "@bsc-swap-agent-demo/shared"
 
 import { BnbCapabilityRegistry } from "../capabilities/registry"
+import { executePlannedPrivateSwap } from "../execution/live-swap"
 import {
+  formatExecutedSwap,
   formatCliCheckpoint,
   formatCliStreamingEvent,
   formatDebugPlan,
@@ -21,6 +23,8 @@ async function main() {
   const debugMode = args.includes("--debug")
   const jsonMode = args.includes("--json")
   const debugJsonMode = args.includes("--debug-json")
+  const dryRunMode = args.includes("--dry-run")
+  const noSubmitMode = args.includes("--no-submit")
   const rawInput = args.filter((arg) => !arg.startsWith("--")).join(" ")
   const rl = readline.createInterface({ input, output })
   const registry = new BnbCapabilityRegistry()
@@ -100,13 +104,30 @@ async function main() {
     }
 
     const result = finalizePlan(sessionId)
+    const shouldExecuteLive = !dryRunMode && !noSubmitMode
+    const execution = shouldExecuteLive
+      ? await executePlannedPrivateSwap({
+          result,
+          network: (process.env.DEMO_NETWORK as "bsc" | "bsc-testnet") || "bsc",
+          walletAddress: process.env.DEMO_WALLET_ADDRESS || undefined,
+          registry,
+          onTrace:
+            !debugMode && !jsonMode && !debugJsonMode
+              ? (line) => {
+                  console.log(line)
+                }
+              : undefined
+        })
+      : undefined
     const rendered = debugJsonMode
-      ? JSON.stringify(toDebugJson(result), null, 2)
+      ? JSON.stringify({ plan: toDebugJson(result), execution }, null, 2)
       : jsonMode
-        ? JSON.stringify(toPresentationJson(result), null, 2)
+        ? JSON.stringify({ plan: toPresentationJson(result), execution }, null, 2)
         : debugMode
-          ? formatDebugPlan(result)
-          : formatPlan(result)
+          ? [formatDebugPlan(result), execution ? JSON.stringify(execution, null, 2) : null].filter(Boolean).join("\n\n")
+          : execution
+            ? formatExecutedSwap(result, execution)
+            : formatPlan(result)
     console.log(`\nAssistant:\n${rendered}\n`)
   } catch (error) {
     const message = error instanceof Error ? toUserFacingErrorMessage(error.message) : "Planning failed."

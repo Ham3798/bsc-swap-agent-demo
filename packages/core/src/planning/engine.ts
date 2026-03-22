@@ -1,4 +1,5 @@
 import type {
+  AllowanceCheckSummary,
   AlternativeRejected,
   CoverageConfidence,
   DecisionTraceField,
@@ -21,8 +22,10 @@ import type {
   TokenRef,
   UnknownField
 } from "@bsc-swap-agent-demo/shared"
+import { createPublicClient, erc20Abi, http, type Address } from "viem"
+import { bsc, bscTestnet } from "viem/chains"
 
-import type { CapabilityRegistry } from "../capabilities/types"
+import type { CapabilityRegistry, TokenResolutionResult } from "../capabilities/types"
 import { buildGuardrails } from "../policy/guardrails"
 import { attachSubmissionRequests } from "../submission/requests"
 import { createPlanningEvent, finalizeDecisionTrace } from "./events"
@@ -187,7 +190,8 @@ export async function* runPlanningStream(input: {
     message: "Resolving sell token metadata.",
     data: { toolName: "resolveToken", inputPreview: [{ label: "query", value: state.intent.sellToken ?? "unknown" }] }
   })
-  const sellToken = await resolveRequiredToken(input.registry, state.intent.sellToken!, input.context.network)
+  const sellTokenResolution = await resolveRequiredToken(input.registry, state.intent.sellToken!, input.context.network)
+  const sellToken = sellTokenResolution.token
   yield emit({
     stage: "liquidity-discovery",
     kind: "tool-succeeded",
@@ -197,7 +201,12 @@ export async function* runPlanningStream(input: {
       toolName: "resolveToken",
       outputPreview: [
         { label: "symbol", value: sellToken.symbol },
-        { label: "address", value: sellToken.address }
+        { label: "address", value: sellToken.address },
+        { label: "resolved", value: sellTokenResolution.resolvedBy },
+        ...(sellTokenResolution.resolvedBy !== "exact-symbol" &&
+        sellTokenResolution.normalizedQuery.toUpperCase() !== sellToken.symbol.toUpperCase()
+          ? [{ label: "normalized", value: sellTokenResolution.normalizedQuery }]
+          : [])
       ]
     }
   })
@@ -209,8 +218,22 @@ export async function* runPlanningStream(input: {
     message: "Resolving buy token metadata.",
     data: { toolName: "resolveToken", inputPreview: [{ label: "query", value: state.intent.buyToken ?? "unknown" }] }
   })
-  const buyToken = await resolveRequiredToken(input.registry, state.intent.buyToken!, input.context.network)
-  const amountRaw = parseAmountToRaw(state.intent.amount!, sellToken.decimals)
+  const buyTokenResolution = await resolveRequiredToken(input.registry, state.intent.buyToken!, input.context.network)
+  const buyToken = buyTokenResolution.token
+  const effectiveAmount = await resolveEffectiveAmount({
+    registry: input.registry,
+    network: input.context.network,
+    walletAddress: input.context.walletAddress,
+    sellToken,
+    requestedAmount: state.intent.amount!
+  })
+  const amountRaw = effectiveAmount.amountRaw
+  const allowanceCheck = await checkAllowanceStatus({
+    network: input.context.network,
+    walletAddress: input.context.walletAddress,
+    sellToken,
+    amountRaw
+  })
   yield emit({
     stage: "liquidity-discovery",
     kind: "tool-succeeded",
@@ -220,7 +243,35 @@ export async function* runPlanningStream(input: {
       toolName: "resolveToken",
       outputPreview: [
         { label: "symbol", value: buyToken.symbol },
-        { label: "address", value: buyToken.address }
+        { label: "address", value: buyToken.address },
+        { label: "resolved", value: buyTokenResolution.resolvedBy },
+        ...(buyTokenResolution.resolvedBy !== "exact-symbol" &&
+        buyTokenResolution.normalizedQuery.toUpperCase() !== buyToken.symbol.toUpperCase()
+          ? [{ label: "normalized", value: buyTokenResolution.normalizedQuery }]
+          : [])
+      ]
+    }
+  })
+  yield emit({
+    stage: "liquidity-discovery",
+    kind: "tool-succeeded",
+    status: "completed",
+    message:
+      allowanceCheck.status === "approve-required"
+        ? "Checked allowance and determined an exact approve is required before swap execution."
+        : allowanceCheck.status === "ok"
+          ? "Checked allowance and confirmed the current JIT spender allowance is sufficient."
+          : allowanceCheck.status === "not-applicable"
+            ? "Allowance check is not required for native sell input."
+            : "Allowance check could not be confirmed during planning.",
+    data: {
+      toolName: "checkAllowance",
+      outputPreview: [
+        { label: "allowance", value: allowanceCheck.status },
+        ...(allowanceCheck.spender ? [{ label: "spender", value: allowanceCheck.spender }] : []),
+        ...(allowanceCheck.currentAllowance ? [{ label: "current", value: allowanceCheck.currentAllowance }] : []),
+        ...(allowanceCheck.requiredAmount ? [{ label: "required", value: allowanceCheck.requiredAmount }] : []),
+        ...(allowanceCheck.note ? [{ label: "note", value: allowanceCheck.note }] : [])
       ]
     }
   })
@@ -232,15 +283,27 @@ export async function* runPlanningStream(input: {
     message: "Fetching route candidates from the quote provider.",
     data: {
       toolName: "getQuoteCandidates",
-      inputPreview: traceTokenInputs(sellToken.symbol, buyToken.symbol, state.intent.amount!)
+      inputPreview: traceTokenInputs(sellToken.symbol, buyToken.symbol, effectiveAmount.amount)
     }
   })
+  for (const provider of listExpectedQuoteProviders()) {
+    yield emit({
+      stage: "liquidity-discovery",
+      kind: "tool-started",
+      status: "running",
+      message: `Requesting a quote from ${provider}.`,
+      data: {
+        toolName: "getQuoteProvider",
+        inputPreview: [{ label: "provider", value: provider }]
+      }
+    })
+  }
   const quoteResult = input.registry.quote.getQuoteCandidatesWithAudit
     ? await input.registry.quote.getQuoteCandidatesWithAudit({
         network: input.context.network,
         sellToken,
         buyToken,
-        amount: state.intent.amount!,
+        amount: effectiveAmount.amount,
         amountRaw,
         slippageBps
       })
@@ -249,7 +312,7 @@ export async function* runPlanningStream(input: {
           network: input.context.network,
           sellToken,
           buyToken,
-          amount: state.intent.amount!,
+          amount: effectiveAmount.amount,
           amountRaw,
           slippageBps
         }),
@@ -309,20 +372,44 @@ export async function* runPlanningStream(input: {
       ]
     }
   })
+  for (const audit of quoteResult.audit) {
+    yield emit({
+      stage: "liquidity-discovery",
+      kind: audit.status === "observed" ? "tool-succeeded" : "tool-failed",
+      status: audit.status === "observed" ? "completed" : "failed",
+      message:
+        audit.status === "observed"
+          ? `Received a quote from ${audit.providerId}.`
+          : `Quote request did not produce an executable route for ${audit.providerId}.`,
+      data: {
+        toolName: "getQuoteProvider",
+        outputPreview: [
+          { label: "provider", value: audit.providerId },
+          { label: "status", value: audit.status },
+          { label: "quote_count", value: String(audit.quoteCount) },
+          ...(audit.latencyMs != null ? [{ label: "latency_ms", value: String(audit.latencyMs) }] : []),
+          ...(audit.reason ? [{ label: "reason", value: audit.reason }] : [])
+        ]
+      }
+    })
+  }
 
-  if (routeCandidatesObserved.length < 2) {
+  if (routeCandidatesObserved.length === 0) {
     yield emit({
       stage: "liquidity-discovery",
       kind: "stage-failed",
       status: "failed",
-      message: "Could not gather enough route candidates to explain execution tradeoffs.",
+      message: "Could not gather any executable route candidates.",
       data: {
         observations: [{ label: "candidate_count", value: String(routeCandidatesObserved.length) }],
-        decision: "Stop because best-execution comparison needs at least two candidates.",
-        error: "Need at least two route candidates to explain best execution tradeoffs."
+        decision: "Stop because no provider returned an executable route for the current token pair and amount.",
+        error:
+          "Could not find an executable route for this swap on BSC. Try a smaller amount, a direct token address, or a different token pair."
       }
     })
-    throw new Error("Need at least two route candidates to explain best execution tradeoffs.")
+    throw new Error(
+      "Could not find an executable route for this swap on BSC. Try a smaller amount, a direct token address, or a different token pair."
+    )
   }
 
   for (const event of await buildStageReasoningEvents({
@@ -344,7 +431,10 @@ export async function* runPlanningStream(input: {
           value: providerUniverseSnapshot.modeledAdapters.join(", ") || "none"
         }
       ],
-      decision: "Use the candidate set as the basis for execution-quality comparison.",
+      decision:
+        routeCandidatesObserved.length === 1
+          ? "Only one executable route was observed, so continue with single-route execution preparation."
+          : "Use the candidate set as the basis for execution-quality comparison.",
       artifacts: routeCandidatesObserved.slice(0, 4).map((candidate) => ({
         label: candidate.id,
         value: candidate.quotedOutFormatted
@@ -390,7 +480,7 @@ export async function* runPlanningStream(input: {
   })
   const mevRiskAssessment = assessMevRisk(routeCandidatesObserved, state.intent)
   const routeCandidates = scoreRoutes(routeCandidatesObserved, mevRiskAssessment, state.intent)
-  const recommendedRoute = routeCandidates[0]
+  let recommendedRoute = routeCandidates[0]
   for (const event of await buildStageReasoningEvents({
     emit,
     stage: "route-comparison",
@@ -446,6 +536,7 @@ export async function* runPlanningStream(input: {
   })
 
   const payloadCandidates: PayloadCandidate[] = []
+  const payloadFailures: Array<{ routeId: string; reason: string }> = []
   for (const [index, candidate] of routeCandidates.slice(0, 2).entries()) {
     yield emit({
       stage: "payload-construction",
@@ -465,7 +556,7 @@ export async function* runPlanningStream(input: {
       platform: candidate.platform,
       sellToken,
       buyToken,
-      amount: state.intent.amount!,
+      amount: effectiveAmount.amount,
       amountRaw,
       slippageBps,
       account: input.context.walletAddress
@@ -505,6 +596,41 @@ export async function* runPlanningStream(input: {
       value: encoded.value
     })
     if (!simulation.ok) {
+      const approvalGatedSimulation =
+        !sellToken.isNative && isAllowanceRecoverableSimulationFailure(simulation.note)
+          ? {
+              ok: true as const,
+              estimatedGas: pickEstimatedGas(simulation.estimatedGas, encoded.estimatedGas, candidate.estimatedGas),
+              note: "approval-required"
+            }
+          : null
+
+      if (approvalGatedSimulation) {
+        yield emit({
+          stage: "payload-construction",
+          kind: "tool-succeeded",
+          status: "completed",
+          message: `Simulation for ${candidate.id} is approval-gated but recoverable through the exact-approve lifecycle.`,
+          data: {
+            toolName: "simulateTransaction",
+            outputPreview: [
+              { label: "estimated_gas", value: approvalGatedSimulation.estimatedGas },
+              { label: "result", value: approvalGatedSimulation.note }
+            ]
+          }
+        })
+        payloadCandidates.push({
+          id: `payload-${index + 1}-${candidate.id}`,
+          type: "router-calldata",
+          routeFamily: candidate.routeFamily,
+          ...encoded,
+          executionMode: "self-executed",
+          approvalRequired: true,
+          simulation: approvalGatedSimulation
+        })
+        continue
+      }
+
       yield emit({
         stage: "payload-construction",
         kind: "tool-failed",
@@ -515,22 +641,8 @@ export async function* runPlanningStream(input: {
           outputPreview: [{ label: "simulation_error", value: simulation.note }]
         }
       })
-      yield emit({
-        stage: "payload-construction",
-        kind: "stage-failed",
-        status: "failed",
-        message: `Built a candidate payload for ${candidate.id}, but direct RPC simulation failed.`,
-        data: {
-          observations: [
-            { label: "target", value: encoded.to },
-            { label: "data_preview", value: `${encoded.data.slice(0, 18)}...` },
-            { label: "data_length", value: String(encoded.data.length) }
-          ],
-          decision: "Stop because the recommended payload must simulate successfully.",
-          error: simulation.note
-        }
-      })
-      throw new Error(`RPC simulation failed for ${candidate.platform}: ${simulation.note}`)
+      payloadFailures.push({ routeId: candidate.id, reason: simulation.note })
+      continue
     }
     yield emit({
       stage: "payload-construction",
@@ -552,11 +664,34 @@ export async function* runPlanningStream(input: {
       ...encoded,
       executionMode: "self-executed",
       approvalRequired: !sellToken.isNative,
-      simulation
+      simulation: {
+        ...simulation,
+        estimatedGas: pickEstimatedGas(simulation.estimatedGas, encoded.estimatedGas, candidate.estimatedGas)
+      }
     })
   }
 
+  if (payloadCandidates.length === 0) {
+    const failureSummary = payloadFailures.map((item) => `${item.routeId} ${item.reason}`).join(", ")
+    yield emit({
+      stage: "payload-construction",
+      kind: "stage-failed",
+      status: "failed",
+      message: "Built candidate payloads, but none simulated successfully.",
+      data: {
+        observations: payloadFailures.map((item) => ({ label: item.routeId, value: item.reason })),
+        decision: "Stop because no execution-ready payload survived simulation.",
+        error: `No payload candidates simulated successfully. ${failureSummary}`
+      }
+    })
+    throw new Error(`No payload candidates simulated successfully. ${failureSummary}`)
+  }
+
   const payload = payloadCandidates[0]
+  recommendedRoute =
+    routeCandidates.find(
+      (candidate) => candidate.platform === payload.platform && candidate.routeFamily === payload.routeFamily
+    ) ?? recommendedRoute
   yield emit({
     stage: "payload-construction",
     kind: "reasoning",
@@ -569,10 +704,16 @@ export async function* runPlanningStream(input: {
         value: `target=${candidate.to}, gas=${candidate.simulation.estimatedGas}`
       })),
       decision: `Use ${payload.id} as the primary payload because it matches the recommended route and passed simulation.`,
-      artifacts: payloadCandidates.map((candidate) => ({
-        label: candidate.id,
-        value: `${candidate.data.slice(0, 18)}... (${candidate.data.length} chars)`
-      }))
+      artifacts: [
+        ...payloadCandidates.map((candidate) => ({
+          label: candidate.id,
+          value: `${candidate.data.slice(0, 18)}... (${candidate.data.length} chars)`
+        })),
+        ...payloadFailures.map((failure) => ({
+          label: `${failure.routeId}-dropped`,
+          value: failure.reason
+        }))
+      ]
     }
   })
   yield emit({
@@ -725,12 +866,26 @@ export async function* runPlanningStream(input: {
     mevRiskLevel: mevRiskAssessment.level,
     preferPrivate: state.intent.preferences.preferPrivate
   })
-  const privatePathRegistrySummary = await input.registry.submission.getPrivatePathRegistrySummary?.({
-    network: input.context.network
-  })
-  const executionCapabilitySummary = await input.registry.submission.getExecutionCapabilitySummary?.({
-    network: input.context.network
-  })
+  const [privatePathRegistrySummary, executionCapabilitySummary] = await Promise.all([
+    withTimeout(
+      Promise.resolve(
+        input.registry.submission.getPrivatePathRegistrySummary?.({
+          network: input.context.network
+        })
+      ),
+      400,
+      "Timed out while loading private path registry summary."
+    ).catch(() => undefined),
+    withTimeout(
+      Promise.resolve(
+        input.registry.submission.getExecutionCapabilitySummary?.({
+          network: input.context.network
+        })
+      ),
+      1200,
+      "Timed out while loading execution capability summary."
+    ).catch(() => undefined)
+  ])
   const capabilityAvailable = deriveExecutionCapabilityNames(executionCapabilitySummary)
   const keptRouteIds = routeCandidates
     .filter((candidate) =>
@@ -748,16 +903,22 @@ export async function* runPlanningStream(input: {
       : ["execution-mcp unavailable, local simulation only"]
   }
   if (executionCapabilitySummary?.available && executionCapabilitySummary.routeSimulationAvailable) {
-    const amountForRouteSim = typeof state.intent.amount === "string" ? state.intent.amount : String(state.intent.amount ?? "")
-    const routeSimulation = await input.registry.submission.simulateCandidateRoutes?.({
-      network: input.context.network,
-      sellToken,
-      buyToken,
-      amount: amountForRouteSim,
-      slippageBps,
-      account: input.context.walletAddress,
-      routeIds: keptRouteIds
-    })
+    const amountForRouteSim = effectiveAmount.amount
+    const routeSimulation = await withTimeout(
+      Promise.resolve(
+        input.registry.submission.simulateCandidateRoutes?.({
+          network: input.context.network,
+          sellToken,
+          buyToken,
+          amount: amountForRouteSim,
+          slippageBps,
+          account: input.context.walletAddress,
+          routeIds: keptRouteIds
+        })
+      ),
+      1500,
+      "Timed out while simulating candidate routes through execution MCP."
+    ).catch(() => undefined)
     if (routeSimulation) {
       executionCapabilityUsage = {
         available: capabilityAvailable,
@@ -787,7 +948,17 @@ export async function* runPlanningStream(input: {
         value: [candidate.liveStatus, candidate.verificationStatus, candidate.sourceType === "registry-backed" ? "registry" : null]
           .filter(Boolean)
           .join(" ")
-      }))
+      })).concat([
+        {
+          label: "selected",
+          value:
+            recommendedSubmission.submissionChannel === "builder-aware-broadcast"
+              ? "builder-private"
+              : recommendedSubmission.submissionChannel === "private-rpc"
+                ? "validator-private"
+                : recommendedSubmission.submissionChannel
+        }
+      ])
     }
   })
   for (const event of await buildStageReasoningEvents({
@@ -1049,6 +1220,7 @@ export async function* runPlanningStream(input: {
   const result = attachSubmissionRequests({
     network: input.context.network,
     walletAddress: input.context.walletAddress,
+    buyTokenAddress: buyToken.address as `0x${string}`,
     result: {
       intent: state.intent,
       missingFieldsResolved: state.missingFieldsResolved,
@@ -1117,6 +1289,7 @@ export async function* runPlanningStream(input: {
         submissionCandidates.some(
           (submission) => submission.submissionChannel === "public-mempool" && submission.liveStatus === "live"
         ),
+      recommendedHandoff: "none",
       bestQuoteRouteId: priceImpactAssessment.bestQuotedRouteId,
       bestReadyRouteId: routeCandidates.find((candidate) =>
         payloadCandidates.some(
@@ -1126,6 +1299,7 @@ export async function* runPlanningStream(input: {
             payloadCandidate.simulation.ok
         )
       )?.id ?? null,
+      allowanceCheck,
       routeExecutionReadiness: routeCandidates.map((candidate) => {
         const payloadCandidate = payloadCandidates.find(
           (payload) => payload.platform === candidate.platform && payload.routeFamily === candidate.routeFamily
@@ -1216,12 +1390,68 @@ function deriveQuoteFreshness(observedAt: string): "fresh" | "stale" {
   return Number.isFinite(ageMs) && ageMs > 20_000 ? "stale" : "fresh"
 }
 
+async function resolveEffectiveAmount(input: {
+  registry: CapabilityRegistry
+  network: SkillContext["network"]
+  walletAddress: string
+  sellToken: TokenRef
+  requestedAmount: string
+}): Promise<{ amount: string; amountRaw: string; source: "user" | "wallet-balance-context" }> {
+  const normalizedAmount = String(input.requestedAmount ?? "").trim()
+  if (normalizedAmount.toLowerCase() !== "all") {
+    return {
+      amount: normalizedAmount,
+      amountRaw: parseAmountToRaw(normalizedAmount, input.sellToken.decimals),
+      source: "user"
+    }
+  }
+
+  const balance = input.sellToken.isNative
+    ? await input.registry.chain.getNativeBalance(input.walletAddress, input.network)
+    : await input.registry.chain.getErc20Balance(input.sellToken.address, input.walletAddress, input.network)
+
+  let raw = BigInt(balance.raw)
+  if (input.sellToken.isNative) {
+    const nativeReserve = 300_000_000_000_000n
+    raw = raw > nativeReserve ? raw - nativeReserve : 0n
+  }
+
+  if (raw <= 0n) {
+    throw new Error(
+      input.sellToken.isNative
+        ? "Wallet does not have enough BNB to swap after reserving gas."
+        : `Wallet does not hold any ${input.sellToken.symbol} to swap.`
+    )
+  }
+
+  const amount = trimFormattedAmount(formatAmountFromRaw(raw.toString(), input.sellToken.decimals))
+  return {
+    amount,
+    amountRaw: raw.toString(),
+    source: "wallet-balance-context"
+  }
+}
+
 function parseAmountToRaw(amount: string, decimals: number): string {
   const normalizedAmount = String(amount ?? "").trim()
   const [wholePart, fractionalPart = ""] = normalizedAmount.split(".")
   const normalizedWhole = wholePart === "" ? "0" : wholePart
   const normalizedFraction = fractionalPart.replace(/[^0-9]/g, "").slice(0, decimals).padEnd(decimals, "0")
   return `${normalizedWhole}${normalizedFraction}`.replace(/^0+(?=\d)/, "") || "0"
+}
+
+function formatAmountFromRaw(raw: string, decimals: number): string {
+  const digits = raw.replace(/^(-?)(\d+)$/, "$1$2")
+  const sign = digits.startsWith("-") ? "-" : ""
+  const unsigned = sign ? digits.slice(1) : digits
+  const padded = unsigned.padStart(decimals + 1, "0")
+  const head = padded.slice(0, -decimals) || "0"
+  const tail = padded.slice(-decimals).replace(/0+$/, "")
+  return tail ? `${sign}${head}.${tail}` : `${sign}${head}`
+}
+
+function trimFormattedAmount(value: string): string {
+  return value.replace(/(\.\d*?)0+$/, "$1").replace(/\.$/, "")
 }
 
 function deriveExecutionCapabilityNames(
@@ -1240,6 +1470,10 @@ function deriveExecutionCapabilityNames(
 }
 
 export function continuePlan(sessionState: PlanningSessionState, userAnswer: string): PlanningSessionState {
+  const pendingField =
+    [...sessionState.events]
+      .reverse()
+      .find((event) => event.kind === "follow-up-required")?.data?.missingField ?? undefined
   return continueWithAnswer(
     {
       intent: sessionState.intent,
@@ -1247,7 +1481,8 @@ export function continuePlan(sessionState: PlanningSessionState, userAnswer: str
       partialEvents: sessionState.events
     },
     `${sessionState.rawInput}\n${userAnswer}`,
-    userAnswer
+    userAnswer,
+    pendingField
   )
 }
 
@@ -1259,6 +1494,30 @@ async function maybeBuildFollowUp(input: {
   sessionId?: string
 }): Promise<{ events: PlanningEvent[] } | null> {
   const unknowns = new Set<UnknownField>(input.state.intent.unknowns)
+  const sellTokenClarification = input.state.intent.sellToken
+    ? await getTokenClarification(input.registry, input.state.intent.sellToken, input.context.network)
+    : null
+  if (sellTokenClarification?.needsFollowUp) {
+    return buildTokenFollowUp({
+      ...input,
+      rawToken: input.state.intent.sellToken!,
+      field: "sell_token",
+      clarification: sellTokenClarification
+    })
+  }
+
+  const buyTokenClarification = input.state.intent.buyToken
+    ? await getTokenClarification(input.registry, input.state.intent.buyToken, input.context.network)
+    : null
+  if (buyTokenClarification?.needsFollowUp) {
+    return buildTokenFollowUp({
+      ...input,
+      rawToken: input.state.intent.buyToken!,
+      field: "buy_token",
+      clarification: buyTokenClarification
+    })
+  }
+
   if (!unknowns.has("amount")) {
     return null
   }
@@ -1389,6 +1648,97 @@ async function maybeBuildFollowUp(input: {
   return { events }
 }
 
+async function getTokenClarification(
+  registry: CapabilityRegistry,
+  rawToken: string,
+  network: SkillContext["network"]
+): Promise<{ needsFollowUp: boolean; suggestions: string[] } | null> {
+  if (!registry.chain.resolveTokenDetailed) {
+    return null
+  }
+
+  const resolution = await registry.chain.resolveTokenDetailed(rawToken, network)
+  if (resolution.resolvedToken || resolution.suggestions.length === 0) {
+    return null
+  }
+
+  return {
+    needsFollowUp: true,
+    suggestions: resolution.suggestions.map((token) => token.symbol)
+  }
+}
+
+function buildTokenFollowUp(input: {
+  state: PlanningSessionState
+  context: SkillContext
+  registry: CapabilityRegistry
+  existingEvents: PlanningEvent[]
+  sessionId?: string
+  rawToken: string
+  field: "sell_token" | "buy_token"
+  clarification: { needsFollowUp: boolean; suggestions: string[] }
+}): { events: PlanningEvent[] } {
+  const emit = (event: Omit<PlanningEvent, "id" | "timestamp" | "sessionId">): PlanningEvent =>
+    createPlanningEvent({ sessionId: input.sessionId, ...event })
+  const suggestionText = input.clarification.suggestions.join(", ")
+  const question =
+    input.clarification.suggestions.length === 1
+      ? `I could not resolve '${input.rawToken}' exactly on ${input.context.network}. Did you mean ${suggestionText}?`
+      : `I could not resolve '${input.rawToken}' exactly on ${input.context.network}. Did you mean one of: ${suggestionText}?`
+  const events: PlanningEvent[] = [
+    emit({
+      stage: "missing-field-resolution",
+      kind: "stage-started",
+      status: "running",
+      message: "Resolving token clarification before route planning.",
+      data: {
+        title: "Missing field resolution",
+        inputPreview: [
+          { label: "field", value: input.field },
+          { label: "raw_token", value: input.rawToken }
+        ]
+      }
+    }),
+    emit({
+      stage: "missing-field-resolution",
+      kind: "reasoning",
+      status: "needs-input",
+      message: "Token resolution was ambiguous, so the system asked a follow-up question.",
+      data: {
+        reasoningSource: "deterministic",
+        observations: [
+          { label: "field", value: input.field },
+          { label: "raw_token", value: input.rawToken },
+          { label: "suggestions", value: suggestionText }
+        ],
+        decision: "Pause planning until the token symbol is confirmed."
+      }
+    })
+  ]
+  const nextState: PlanningSessionState = {
+    rawInput: input.state.rawInput,
+    intent: input.state.intent,
+    missingFieldsResolved: input.state.missingFieldsResolved,
+    events: [...input.existingEvents, ...events]
+  }
+  events.push(
+    emit({
+      stage: "missing-field-resolution",
+      kind: "follow-up-required",
+      status: "needs-input",
+      message: question,
+      data: {
+        question,
+        missingField: input.field,
+        intent: input.state.intent,
+        missingFieldsResolved: input.state.missingFieldsResolved,
+        state: nextState
+      }
+    })
+  )
+  return { events }
+}
+
 function yieldToolStarted(
   events: PlanningEvent[],
   emit: (event: Omit<PlanningEvent, "id" | "timestamp" | "sessionId">) => PlanningEvent,
@@ -1511,7 +1861,6 @@ function shouldUseLlmSummary(stage: PlanningEvent["stage"]): boolean {
     stage === "path-quality-assessment" ||
     stage === "price-impact-assessment" ||
     stage === "mev-risk-assessment" ||
-    stage === "submission-strategy" ||
     stage === "final-recommendation"
   )
 }
@@ -1918,12 +2267,27 @@ async function resolveRequiredToken(
   registry: CapabilityRegistry,
   symbol: string,
   network: SkillContext["network"]
-): Promise<TokenRef> {
-  const token = await registry.chain.resolveToken(symbol, network)
-  if (!token) {
-    throw new Error(`Could not resolve token '${symbol}' on ${network}.`)
+): Promise<{ token: TokenRef; resolvedBy: string; normalizedQuery: string; suggestions: TokenRef[] }> {
+  const resolution = registry.chain.resolveTokenDetailed
+    ? await registry.chain.resolveTokenDetailed(symbol, network)
+    : {
+        resolvedToken: await registry.chain.resolveToken(symbol, network),
+        resolvedBy: "exact-symbol",
+        normalizedQuery: symbol,
+        suggestions: []
+      } satisfies TokenResolutionResult
+  if (!resolution.resolvedToken) {
+    const suggestion = resolution.suggestions.length
+      ? ` suggest ${resolution.suggestions.map((token) => token.symbol).join(", ")}`
+      : ""
+    throw new Error(`Could not resolve token '${symbol}' on ${network}.${suggestion}`)
   }
-  return token
+  return {
+    token: resolution.resolvedToken,
+    resolvedBy: resolution.resolvedBy,
+    normalizedQuery: resolution.normalizedQuery,
+    suggestions: resolution.suggestions
+  }
 }
 
 function traceTokenInputs(sellToken: string, buyToken: string, amount: string) {
@@ -1964,4 +2328,97 @@ function normalizeVenueName(value: string): string {
     .replace(/^woofi/, "woofi")
     .replace(/^uniswapv\d+/i, "uniswap")
     .replace(/^uniswap/, "uniswap")
+}
+
+function isAllowanceRecoverableSimulationFailure(note: string): boolean {
+  const normalized = String(note ?? "").toLowerCase()
+  return normalized.includes("transfer amount exceeds allowance") || normalized.includes("exceeds allowance")
+}
+
+function pickEstimatedGas(...candidates: Array<string | undefined>): string {
+  for (const candidate of candidates) {
+    if (!candidate) continue
+    const normalized = String(candidate).trim()
+    if (!normalized || normalized === "0") continue
+    return normalized
+  }
+  return "0"
+}
+
+function listExpectedQuoteProviders(): string[] {
+  return ["openoceanv2", "paraswap", "pancakeswap", "thena", "woofi", "matcha", "1inch"]
+}
+
+async function checkAllowanceStatus(input: {
+  network: SkillContext["network"]
+  walletAddress: string
+  sellToken: TokenRef
+  amountRaw: string
+}): Promise<AllowanceCheckSummary> {
+  if (input.sellToken.isNative) {
+    return {
+      status: "not-applicable",
+      token: input.sellToken.symbol,
+      requiredAmount: input.amountRaw,
+      note: "native sell token does not use ERC-20 allowance"
+    }
+  }
+
+  const spender =
+    input.network === "bsc" ? process.env.JIT_ROUTER_BSC_ADDRESS : process.env.JIT_ROUTER_BSC_TESTNET_ADDRESS
+  if (!spender || isDeprecatedJitRouterAddress(spender)) {
+    return {
+      status: "unavailable",
+      token: input.sellToken.symbol,
+      requiredAmount: input.amountRaw,
+      note: "secure jit router address is not configured"
+    }
+  }
+
+  const rpcUrl = input.network === "bsc" ? process.env.BSC_RPC_URL : process.env.BSC_TESTNET_RPC_URL
+  if (!rpcUrl) {
+    return {
+      status: "unavailable",
+      spender,
+      token: input.sellToken.symbol,
+      requiredAmount: input.amountRaw,
+      note: "rpc url unavailable for allowance read"
+    }
+  }
+
+  try {
+    const client = createPublicClient({
+      chain: input.network === "bsc" ? bsc : bscTestnet,
+      transport: http(rpcUrl)
+    })
+    const currentAllowance = await client.readContract({
+      address: input.sellToken.address as Address,
+      abi: erc20Abi,
+      functionName: "allowance",
+      args: [input.walletAddress as Address, spender as Address]
+    })
+    return {
+      status: currentAllowance >= BigInt(input.amountRaw) ? "ok" : "approve-required",
+      spender,
+      token: input.sellToken.symbol,
+      currentAllowance: currentAllowance.toString(),
+      requiredAmount: input.amountRaw
+    }
+  } catch (error) {
+    return {
+      status: "unavailable",
+      spender,
+      token: input.sellToken.symbol,
+      requiredAmount: input.amountRaw,
+      note: error instanceof Error ? error.message : String(error)
+    }
+  }
+}
+
+function isDeprecatedJitRouterAddress(value: string): boolean {
+  const normalized = value.toLowerCase()
+  return (
+    normalized === "0x84361f416ae89435fe857ce6220545317244ceca" ||
+    normalized === "0x373f33cb87196f58be01d10e2a998019ac00c23b"
+  )
 }
