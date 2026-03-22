@@ -20,7 +20,8 @@ import type {
   ChainCapabilityAdapter,
   MarketIntelligenceAdapter,
   QuoteCapabilityAdapter,
-  SubmissionCapabilityAdapter
+  SubmissionCapabilityAdapter,
+  TokenResolutionResult
 } from "../capabilities/types"
 import { formatDebugPlan, formatPlan, formatStreamingUpdate } from "../format/output"
 import { runPlanningStream } from "../planning/engine"
@@ -29,6 +30,11 @@ import { continuePlanningSession, startPlanningSession } from "../session/store"
 import { buildPublicTransactionRequest } from "../submission/requests"
 
 class MockChainAdapter implements ChainCapabilityAdapter {
+  private readonly tokens: TokenRef[] = [
+    { symbol: "USDT", address: "0xusdt", decimals: 18 },
+    { symbol: "BNB", address: "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE", decimals: 18, isNative: true },
+    { symbol: "CAKE", address: "0xcake", decimals: 18 }
+  ]
   async listTools(): Promise<string[]> {
     return []
   }
@@ -44,19 +50,42 @@ class MockChainAdapter implements ChainCapabilityAdapter {
   async getErc20TokenInfo() {
     return {}
   }
-  async resolveToken(query: string): Promise<TokenRef | null> {
-    if (query.toUpperCase() === "USDT") {
-      return { symbol: "USDT", address: "0xusdt", decimals: 18 }
-    }
-    if (query.toUpperCase() === "BNB") {
+  async resolveToken(query: string, network: Network): Promise<TokenRef | null> {
+    return (await this.resolveTokenDetailed(query, network)).resolvedToken
+  }
+  async resolveTokenDetailed(query: string, _network: Network): Promise<TokenResolutionResult> {
+    const normalized = query.trim().toUpperCase()
+    if (normalized === "Pancake swap token".toUpperCase() || normalized === "Pancake token".toUpperCase()) {
       return {
-        symbol: "BNB",
-        address: "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE",
-        decimals: 18,
-        isNative: true
+        resolvedToken: this.tokens.find((token) => token.symbol === "CAKE") ?? null,
+        resolvedBy: "alias",
+        normalizedQuery: "CAKE",
+        suggestions: []
       }
     }
-    return null
+    const exact = this.tokens.find((token) => token.symbol === normalized || token.address.toLowerCase() === query.toLowerCase())
+    if (exact) {
+      return {
+        resolvedToken: exact,
+        resolvedBy: "exact-symbol",
+        normalizedQuery: exact.symbol,
+        suggestions: []
+      }
+    }
+    if (normalized === "PANCAKE") {
+      return {
+        resolvedToken: null,
+        resolvedBy: "unresolved",
+        normalizedQuery: "pancake",
+        suggestions: [this.tokens.find((token) => token.symbol === "CAKE")!]
+      }
+    }
+    return {
+      resolvedToken: null,
+      resolvedBy: "unresolved",
+      normalizedQuery: normalized.toLowerCase(),
+      suggestions: []
+    }
   }
   async estimateGas() {
     return { estimatedGas: "100000" }
@@ -69,7 +98,7 @@ class MockQuoteAdapter implements QuoteCapabilityAdapter {
   }
   async getQuoteCandidatesWithAudit(): Promise<any> {
     return {
-      observedAt: "2026-03-22T10:00:00.000Z",
+      observedAt: new Date().toISOString(),
       audit: [
         {
           providerId: "openoceanv2",
@@ -373,8 +402,8 @@ class MockSubmissionAdapter implements SubmissionCapabilityAdapter {
         path: "private-rpc",
         submissionChannel: "private-rpc",
         providerName: "PancakeSwap Private RPC",
-        availability: "stub",
-        liveStatus: "advisory",
+        availability: "live",
+        liveStatus: "live",
         recommended: input.mevRiskLevel !== "low",
         routeFamilies: ["direct-dex", "aggregator"],
         plannerControlLevel: "handoff",
@@ -427,8 +456,8 @@ class MockSubmissionAdapter implements SubmissionCapabilityAdapter {
         path: "private-rpc",
         submissionChannel: "builder-aware-broadcast",
         providerName: "Builder-aware private broadcast",
-        availability: "stub",
-        liveStatus: "advisory",
+        availability: "live",
+        liveStatus: "live",
         recommended: false,
         routeFamilies: ["direct-dex", "aggregator"],
         plannerControlLevel: "handoff",
@@ -451,6 +480,41 @@ class MockRegistry implements CapabilityRegistry {
   submission = new MockSubmissionAdapter()
   market = new MockMarketAdapter()
   async close(): Promise<void> {}
+}
+
+class CapturingQuoteAdapter extends MockQuoteAdapter {
+  lastAmount?: string
+  lastAmountRaw?: string
+
+  override async getQuoteCandidatesWithAudit(input?: { amount: string; amountRaw: string }): Promise<any> {
+    this.lastAmount = input?.amount
+    this.lastAmountRaw = input?.amountRaw
+    return super.getQuoteCandidatesWithAudit()
+  }
+}
+
+class SingleRouteQuoteAdapter extends MockQuoteAdapter {
+  override async getQuoteCandidatesWithAudit(): Promise<any> {
+    const base = await super.getQuoteCandidatesWithAudit()
+    return {
+      ...base,
+      candidates: base.candidates.slice(0, 1),
+      audit: [
+        { providerId: "openoceanv2", category: "aggregator", mode: "native", status: "observed", quoteCount: 1 },
+        { providerId: "paraswap", category: "aggregator", mode: "native", status: "failed", reason: "quote-api-error", quoteCount: 0 }
+      ]
+    }
+  }
+}
+
+class ApprovalBlockedQuoteAdapter extends MockQuoteAdapter {
+  override async simulateTransaction() {
+    return {
+      ok: false,
+      estimatedGas: "145000",
+      note: "Gas estimation unavailable: Execution reverted with reason: BEP20: transfer amount exceeds allowance"
+    }
+  }
 }
 
 describe("core planning engine", () => {
@@ -532,6 +596,140 @@ describe("core planning engine", () => {
     }
   })
 
+  it("auto-resolves obvious protocol token aliases", async () => {
+    const registry = new MockRegistry()
+    const session = await startPlanningSession({
+      message: "Swap 0.001 BNB to Pancake swap token with low MEV risk",
+      network: "bsc",
+      walletAddress: "0xwallet",
+      registry,
+      intentExtractor: async () => ({
+        action: "swap",
+        sellToken: "BNB",
+        buyToken: "PANCAKE SWAP TOKEN",
+        amount: "0.001",
+        slippageBps: null,
+        preferences: {
+          preferPrivate: true,
+          preferFast: false,
+          avoidStale: false
+        },
+        unknowns: []
+      }),
+      stageSummarizer: mockStageSummarizer
+    })
+
+    expect(session.response?.kind).toBe("plan")
+    if (session.response?.kind === "plan") {
+      expect(session.response.result.routeCandidates.length).toBeGreaterThan(0)
+      const resolution = await registry.chain.resolveTokenDetailed?.("PANCAKE SWAP TOKEN", "bsc")
+      expect(resolution?.resolvedBy).toBe("alias")
+      expect(resolution?.resolvedToken?.symbol).toBe("CAKE")
+    }
+  })
+
+  it("resolves all-in sell amounts from wallet balance before quoting", async () => {
+    const registry = new MockRegistry()
+    const quote = new CapturingQuoteAdapter()
+    registry.quote = quote
+
+    const session = await startPlanningSession({
+      message: "Swap all USDT to BNB",
+      network: "bsc",
+      walletAddress: "0xwallet",
+      registry,
+      intentExtractor: async () => ({
+        action: "swap",
+        sellToken: "USDT",
+        buyToken: "BNB",
+        amount: "all",
+        slippageBps: null,
+        preferences: {
+          preferPrivate: true,
+          preferFast: false,
+          avoidStale: false
+        },
+        unknowns: []
+      }),
+      stageSummarizer: mockStageSummarizer
+    })
+
+    expect(session.response?.kind).toBe("plan")
+    expect(quote.lastAmount).toBe("250")
+    expect(quote.lastAmountRaw).toBe("250000000000000000000")
+  })
+
+  it("continues planning when only one executable route is observed", async () => {
+    const registry = new MockRegistry()
+    registry.quote = new SingleRouteQuoteAdapter()
+
+    const session = await startPlanningSession({
+      message: "Swap 100 USDT to BNB",
+      network: "bsc",
+      walletAddress: "0xwallet",
+      registry,
+      intentExtractor: mockIntentExtractor,
+      stageSummarizer: mockStageSummarizer
+    })
+
+    expect(session.response?.kind).toBe("plan")
+    if (session.response?.kind === "plan") {
+      expect(session.response.result.routeCandidates).toHaveLength(1)
+      expect(session.response.result.payloadCandidates.length).toBeGreaterThan(0)
+    }
+  })
+
+  it("continues planning when ERC20 sell routes are approval-gated", async () => {
+    const registry = new MockRegistry()
+    registry.quote = new ApprovalBlockedQuoteAdapter()
+
+    const session = await startPlanningSession({
+      message: "Swap 100 USDT to BNB",
+      network: "bsc",
+      walletAddress: "0xwallet",
+      registry,
+      intentExtractor: mockIntentExtractor,
+      stageSummarizer: mockStageSummarizer
+    })
+
+    expect(session.response?.kind).toBe("plan")
+    if (session.response?.kind === "plan") {
+      expect(session.response.result.payloadCandidates.length).toBeGreaterThan(0)
+      expect(session.response.result.payloadCandidates[0]?.approvalRequired).toBe(true)
+      expect(session.response.result.payloadCandidates[0]?.simulation.ok).toBe(true)
+      expect(session.response.result.payloadCandidates[0]?.simulation.note).toBe("approval-required")
+    }
+  })
+
+  it("asks a follow-up when a token phrase stays ambiguous", async () => {
+    const registry = new MockRegistry()
+    const session = await startPlanningSession({
+      message: "Swap 0.001 BNB to Pancake with low MEV risk",
+      network: "bsc",
+      walletAddress: "0xwallet",
+      registry,
+      intentExtractor: async () => ({
+        action: "swap",
+        sellToken: "BNB",
+        buyToken: "PANCAKE",
+        amount: "0.001",
+        slippageBps: null,
+        preferences: {
+          preferPrivate: true,
+          preferFast: false,
+          avoidStale: false
+        },
+        unknowns: []
+      }),
+      stageSummarizer: mockStageSummarizer
+    })
+
+    expect(session.response?.kind).toBe("follow-up")
+    if (session.response?.kind === "follow-up") {
+      expect(session.response.question).toContain("Did you mean CAKE")
+    }
+  })
+
   it("formats a plan with execution reasoning and submission request contracts", async () => {
     const registry = new MockRegistry()
     const session = await startPlanningSession({
@@ -559,13 +757,21 @@ describe("core planning engine", () => {
 
     expect(formatted).toContain("known")
     expect(formatted).toContain("best")
+    expect(formatted).toContain("live")
+    expect(formatted).toContain("ops")
+    expect(formatted).toContain("used")
+    expect(formatted).toContain("evidence")
+    expect(formatted).toContain("sign")
     expect(formatted).toContain("guard")
     expect(formatted).toContain("next")
     expect(formatted).toContain("boundary")
     expect(formatted).toContain("slippage=")
     expect(formatted).toContain("dry-run=")
+    expect(formatted).not.toContain("caps")
     expect(formatted).not.toContain("### JSON")
     expect(formatted).not.toContain("execution_packages")
+    expect(formatted).toContain("evidence")
+    expect(formatted).toContain("local simulation only")
     expect(debugFormatted).toContain("### Decision Trace")
     expect(debugFormatted).toContain("execution_packages")
     expect(bestPricePackage).toBeTruthy()
@@ -583,17 +789,24 @@ describe("core planning engine", () => {
     expect(result.executionReadyNow).toBeTruthy()
     expect(result.bestQuoteRouteId).toBeTruthy()
     expect(result.bestReadyRouteId).toBeTruthy()
+    expect(result.jitRouterRequest).toBeUndefined()
     expect(result.providerUniverseSnapshot.modeledAdapters).toContain("Matcha / 0x")
     expect(result.alternativesRejected.length).toBeGreaterThanOrEqual(1)
     expect(result.decisionTrace.some((step) => step.stage === "price-impact-assessment")).toBe(true)
     expect(result.executionBoundary.externalExecutorControls.length).toBeGreaterThan(0)
     expect(presentation.presentationTrace).toHaveLength(3)
     expect(presentation.intentSummary).not.toContain("summary_error")
-    expect(presentation.recommendationSummary).toContain("preferred live execution is public wallet broadcast")
+    expect(presentation.recommendationSummary).toContain("preferred handoff is builder relay handoff")
     expect(presentation.boundarySummary).toContain("I control the planning")
     expect(presentation.quoteConfidenceSummary).toContain("observed market read")
     expect(presentation.quoteConfidenceSummary).not.toContain("Still modeled through OpenOcean")
     expect(presentation.routeCards.length).toBeGreaterThan(0)
+    expect(result.recommendedHandoff).toBe("builder-broadcast-handoff")
+    expect(result.privateSubmitRequest?.liveStatus).toBe("live")
+    expect(result.privateSubmitRequest?.cliCommand).toContain("submit:private")
+    expect(formatted).toContain("builder-broadcast-handoff")
+    expect(formatted).toContain("signed raw tx required")
+    expect(formatted).not.toContain("experimental")
   })
 
   it("streams tool and stage events before finalizing the plan", async () => {
@@ -829,5 +1042,12 @@ describe("core planning engine", () => {
     expect(message).toBe(
       "The selected wallet does not have enough BNB to cover the swap value plus gas for simulation."
     )
+  })
+
+  it("surfaces token resolution suggestions in user-facing errors", () => {
+    const message = toUserFacingErrorMessage("Could not resolve token 'PANCAKE SWAP TOKEN' on bsc. suggest CAKE")
+
+    expect(message).toContain("Could not resolve token")
+    expect(message).toContain("Did you mean CAKE")
   })
 })

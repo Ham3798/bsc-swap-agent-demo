@@ -8,6 +8,7 @@ export type {
 } from "./capabilities/types"
 export {
   formatPlan,
+  formatExecutedSwap,
   formatDebugPlan,
   formatStreamingUpdate,
   buildPartialPresentationTrace,
@@ -38,7 +39,10 @@ export {
   buildPrivateSubmissionRequest,
   buildPublicTransactionRequest
 } from "./submission/requests"
+export { encodeJitRouterExecute, getJitRouterAddress } from "./submission/jit-router"
+export type { JitCandidateCall } from "./submission/jit-router"
 export { auditExecution, broadcastPrivateRawTransaction } from "./submission/private-execution"
+export { executePlannedPrivateSwap, deriveExecutionFeedback } from "./execution/live-swap"
 export {
   loadPrivateSubmissionRegistry,
   probeRegistryEndpointById,

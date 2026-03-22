@@ -7,6 +7,8 @@ import {
   BnbCapabilityRegistry,
   auditExecution,
   broadcastPrivateRawTransaction,
+  encodeJitRouterExecute,
+  getJitRouterAddress,
   loadPrivateSubmissionRegistry,
   probeRegistryEndpointById
 } from "@bsc-swap-agent-demo/core"
@@ -29,6 +31,7 @@ if (process.argv.includes("--help")) {
   console.error("  - multi_builder_broadcast_raw")
   console.error("  - audit_swap_execution")
   console.error("  - simulate_candidate_routes")
+  console.error("  - encode_jit_router_call")
   process.exit(0)
 }
 
@@ -183,6 +186,70 @@ server.registerTool(
       blockNumber: audit.blockNumber?.toString(),
       gasUsed: audit.gasUsed?.toString(),
       effectiveGasPrice: audit.effectiveGasPrice?.toString()
+    })
+  }
+)
+
+server.registerTool(
+  "encode_jit_router_call",
+  {
+    description: "Encode a call to the deployed secure JIT v2.1 swap router for signed-order best-of-3 execution.",
+    inputSchema: {
+      network: NetworkSchema.default("bsc"),
+      routerAddress: z.string().regex(/^0x[a-fA-F0-9]{40}$/).optional(),
+      order: z.object({
+        user: z.string().regex(/^0x[a-fA-F0-9]{40}$/),
+        recipient: z.string().regex(/^0x[a-fA-F0-9]{40}$/),
+        tokenIn: z.string().regex(/^0x[a-fA-F0-9]{40}$/),
+        tokenOut: z.string().regex(/^0x[a-fA-F0-9]{40}$/),
+        amountIn: z.string().min(1),
+        minOut: z.string().min(1),
+        maxBlockNumber: z.union([z.bigint().min(1n), z.number().int().min(1), z.string().min(1)]),
+        nonce: z.union([z.bigint().min(0n), z.number().int().min(0), z.string().min(1)]),
+        candidateSetHash: z.string().regex(/^0x[a-fA-F0-9]{64}$/)
+      }),
+      candidates: z.array(z.object({
+        adapterId: z.number().int().min(0).max(2),
+        router: z.string().regex(/^0x[a-fA-F0-9]{40}$/),
+        value: z.string().min(1),
+        data: z.string().regex(/^0x[a-fA-F0-9]*$/)
+      })).length(3),
+      signature: z.string().regex(/^0x[a-fA-F0-9]+$/)
+    }
+  },
+  async ({ network, routerAddress, order, candidates, signature }) => {
+    const payload = encodeJitRouterExecute({
+      network,
+      routerAddress: routerAddress as `0x${string}` | undefined,
+      order: {
+        user: order.user as `0x${string}`,
+        recipient: order.recipient as `0x${string}`,
+        tokenIn: order.tokenIn as `0x${string}`,
+        tokenOut: order.tokenOut as `0x${string}`,
+        amountIn: order.amountIn,
+        minOut: order.minOut,
+        maxBlockNumber: typeof order.maxBlockNumber === "bigint" ? order.maxBlockNumber : BigInt(order.maxBlockNumber),
+        nonce: typeof order.nonce === "bigint" ? order.nonce : BigInt(order.nonce),
+        candidateSetHash: order.candidateSetHash as `0x${string}`
+      },
+      candidates: candidates as Array<{
+        adapterId: number
+        router: `0x${string}`
+        value: string
+        data: `0x${string}`
+      }>,
+      signature: signature as `0x${string}`
+    })
+
+    return toolResult({
+      network,
+      routerAddress: payload.routerAddress,
+      configuredRouterAddress: getJitRouterAddress(network),
+      payloadType: payload.payloadType,
+      to: payload.to,
+      value: payload.value,
+      data: payload.data,
+      candidateCount: candidates.length
     })
   }
 )

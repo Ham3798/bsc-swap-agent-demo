@@ -6,7 +6,8 @@ import {
   type PlanningEvent,
   type PlanningResult,
   type PartialPresentationTraceItem,
-  type PresentationResult
+  type PresentationResult,
+  type SwapExecutionSummary
 } from "@bsc-swap-agent-demo/shared"
 
 export function formatPlan(result: PlanningResult): string {
@@ -39,9 +40,35 @@ export function formatPlan(result: PlanningResult): string {
   const builderPath = result.submissionCandidates.find(
     (candidate) => candidate.submissionChannel === "builder-aware-broadcast"
   )
-  const intentPath = result.submissionCandidates.find(
-    (candidate) => candidate.submissionChannel === "centralized-intent-server"
-  )
+  const opsAvailable = [
+    result.privateSubmitRequest ? "private-submit" : null,
+    builderPath?.availability === "live" ? "builder-broadcast" : null,
+    result.executionCapabilityUsage.available.includes("audit") ? "audit" : null
+  ].filter(Boolean) as string[]
+  const evidenceLine =
+    result.executionCapabilityUsage.used.includes("route-sim")
+      ? "route-sim confirmed kept candidates"
+      : "local simulation only"
+  const liveLabel =
+    result.recommendedHandoff === "private-rpc-handoff"
+      ? "private-rpc-handoff"
+      : result.recommendedHandoff === "builder-broadcast-handoff"
+        ? "builder-broadcast-handoff"
+        : result.recommendedHandoff === "public-wallet"
+          ? "public-wallet"
+          : "none"
+  const nextStep =
+    result.recommendedHandoff === "private-rpc-handoff" && result.privateSubmitRequest
+      ? result.privateSubmitRequest.userAction ??
+        "Sign the payload locally, then submit the raw transaction through private delivery."
+      : result.recommendedHandoff === "builder-broadcast-handoff" && result.privateSubmitRequest
+        ? result.privateSubmitRequest.userAction ??
+          "Sign the payload locally, then broadcast the raw transaction to builder relays."
+        : result.executionReadyNow
+          ? "sign and broadcast via wallet now"
+          : quoteFreshness === "stale"
+            ? "refresh quote before execution"
+            : "do not execute yet"
   const lines = [
     formatConsoleLine("known", [
       `routes=${result.observedRouteIds.length}`,
@@ -52,20 +79,53 @@ export function formatPlan(result: PlanningResult): string {
       bestQuote ? `quote=${bestQuote.platform} ${bestQuote.quotedOutFormatted}` : "quote=none",
       bestReadyRoute ? `ready=${bestReadyRoute.platform}` : "ready=none"
     ]),
-    result.executionCapabilityUsage.available.length || result.executionCapabilitySummary
-      ? formatConsoleLine(
-          "caps",
-          [
-            `available=${result.executionCapabilityUsage.available.length ? result.executionCapabilityUsage.available.join(",") : "none"}`
-          ],
-          result.executionCapabilitySummary?.available ? "success" : "warn"
-        )
-      : null,
+    formatConsoleLine(
+      "live",
+      [liveLabel],
+      liveLabel === "none" ? "warn" : "success"
+    ),
+    formatConsoleLine(
+      "ops",
+      [opsAvailable.length ? `${opsAvailable.join(",")} available` : "none"],
+      opsAvailable.length ? "success" : "dim"
+    ),
     formatConsoleLine(
       "used",
       [result.executionCapabilityUsage.used.length ? result.executionCapabilityUsage.used.join(",") : "none"],
       result.executionCapabilityUsage.used.length ? "success" : "dim"
     ),
+    formatConsoleLine("evidence", [evidenceLine], "dim"),
+    result.allowanceCheck
+      ? formatConsoleLine(
+          "allowance",
+          [
+            result.allowanceCheck.status,
+            result.allowanceCheck.spender ? `spender=${shortAddress(result.allowanceCheck.spender)}` : null,
+            result.allowanceCheck.currentAllowance
+              ? `current=${shortAmount(result.allowanceCheck.currentAllowance)}`
+              : null,
+            result.allowanceCheck.requiredAmount
+              ? `required=${shortAmount(result.allowanceCheck.requiredAmount)}`
+              : null
+          ].filter(Boolean) as string[],
+          result.allowanceCheck.status === "approve-required"
+            ? "warn"
+            : result.allowanceCheck.status === "ok" || result.allowanceCheck.status === "not-applicable"
+              ? "success"
+              : "dim"
+        )
+      : null,
+    result.privateSubmitRequest
+      ? formatConsoleLine(
+          "sign",
+          [
+            "signed raw tx required",
+            `channel=${result.privateSubmitRequest.preferredChannel ?? "validator"}`,
+            `targets=${result.privateSubmitRequest.recommendedTargetCount ?? 1}`
+          ],
+          result.recommendedHandoff === "public-wallet" ? "dim" : "warn"
+        )
+      : null,
     bestQuote && bestReadyRoute && bestQuote.id !== bestReadyRoute.id
       ? formatConsoleLine("why", ["best quote was not the strongest execution-ready route"], "dim")
       : null,
@@ -83,35 +143,166 @@ export function formatPlan(result: PlanningResult): string {
           result.publicSubmitRequest.minOutAmount ? `minOut=${shortAmount(result.publicSubmitRequest.minOutAmount)}` : null,
           result.publicSubmitRequest.gas ? `gas=${result.publicSubmitRequest.gas}` : null,
           result.publicSubmitRequest.deadlineSeconds ? `deadline=${result.publicSubmitRequest.deadlineSeconds}s` : null,
-          `path=${result.publicSubmitRequest.path}`
+          `path=${
+            result.recommendedHandoff === "private-rpc-handoff"
+              ? "private-rpc-handoff"
+              : result.recommendedHandoff === "builder-broadcast-handoff"
+                ? "builder-broadcast-handoff"
+                : result.publicSubmitRequest.path
+          }`
         ].filter(Boolean) as string[])
       : null,
-    formatConsoleLine(
-      "live",
-      [result.executionReadyNow ? "public wallet handoff ready" : "public wallet handoff blocked"],
-      result.executionReadyNow ? "success" : "warn"
-    ),
-    formatConsoleLine(
-      "advisory",
-      [
-        privatePath ? "private validator" : null,
-        builderPath ? "builder relay" : null
-      ].filter(Boolean) as string[],
-      "dim"
-    ),
+    result.jitRouterRequest
+      ? formatConsoleLine("jit", [
+          "secure",
+          `router=${shortAddress(result.jitRouterRequest.routerAddress)}`,
+          `candidates=${result.jitRouterRequest.candidates.length}`,
+          `minOut=${shortAmount(result.jitRouterRequest.order.minOutAmount)}`
+        ])
+      : null,
     formatConsoleLine(
       "next",
-      [result.executionReadyNow ? "execute via wallet now" : quoteFreshness === "stale" ? "refresh quote before execution" : "do not execute yet"],
-      result.executionReadyNow ? "success" : "warn"
+      [nextStep],
+      liveLabel === "none" ? "warn" : "success"
     ),
     formatConsoleLine(
       "boundary",
-      ["planner builds/checks, user signs, private delivery external"],
+      [
+        [
+          "planner builds/checks/handoff",
+          "user signs",
+          privatePath || builderPath ? "private delivery supported after raw-tx handoff" : null
+        ]
+          .filter(Boolean)
+          .join("; ")
+      ],
       "dim"
     )
   ]
 
   return lines.filter(Boolean).join("\n")
+}
+
+export function formatExecutedSwap(result: PlanningResult, execution: SwapExecutionSummary): string {
+  const selectedRoute =
+    result.routeCandidates.find((route) => route.id === result.recommendedPlan.routeId) ?? result.routeCandidates[0]
+  const payload =
+    result.payloadCandidates.find((candidate) => candidate.id === result.recommendedPlan.payloadId) ??
+    result.payloadCandidates[0]
+  const buySymbol = result.intent.buyToken ?? "token"
+  const inferredDecimals = selectedRoute ? inferDecimalsFromQuote(selectedRoute.quotedOut, selectedRoute.quotedOutFormatted) : null
+  const quoteSummary = selectedRoute
+    ? `${selectedRoute.platform} ${selectedRoute.quotedOutFormatted}`
+    : "none"
+  const jitCandidateCount = execution.executionVariant === "jit-v21" ? 3 : 0
+  const decisionReason =
+    execution.recommendedHandoff === "builder-broadcast-handoff" && execution.executionVariant === "jit-v21"
+      ? "secure jit v2.1 private execution is the live path when exactly 3 native candidates are ready"
+      : execution.recommendedHandoff === "builder-broadcast-handoff"
+        ? "direct self-executed route used builder-private delivery because JIT live criteria were not met"
+      : execution.skippedReason ?? "live execution was skipped"
+
+  return [
+    formatConsoleLine("intent", [
+      `swap ${result.intent.amount ?? "unknown"} ${result.intent.sellToken ?? "unknown"} -> ${result.intent.buyToken ?? "unknown"}`
+    ]),
+    formatConsoleLine("tokens", [
+      `${result.intent.sellToken ?? "unknown"} -> ${result.intent.buyToken ?? "unknown"}`
+    ]),
+    formatConsoleLine("quotes", [
+      `observed=${result.observedRouteIds.length}`,
+      `best=${quoteSummary}`
+    ]),
+    formatConsoleLine("payload", [
+      `route=${selectedRoute?.platform ?? "unknown"}`,
+      `jitCandidates=${jitCandidateCount}`,
+      `gas=${payload?.simulation.estimatedGas ?? payload?.estimatedGas ?? "unknown"}`,
+      `simulation=${payload?.simulation.ok ? "ok" : "failed"}`
+    ]),
+    formatConsoleLine("decision", [
+      `route=${
+        execution.recommendedHandoff === "builder-broadcast-handoff" && execution.executionVariant === "jit-v21"
+          ? "jit-v2.1(best-of-3)"
+          : selectedRoute?.platform ?? "unknown"
+      }`,
+      `path=${execution.recommendedHandoff}`,
+      decisionReason
+    ]),
+    execution.approval
+      ? formatConsoleLine("approval", [
+          `required=yes`,
+          `submitted=${execution.approval.submitted ? "yes" : "no"}`,
+          execution.approval.submission ? `accepted=${execution.approval.submission.acceptedCount}/${execution.approval.submission.endpointCount}` : null,
+          execution.approval.audit?.status ? `status=${execution.approval.audit.status}` : null,
+          execution.approval.audit?.inclusionBlockDelta != null ? `blocks=${execution.approval.audit.inclusionBlockDelta}` : null,
+          execution.approval.audit?.inclusionWallClockMs != null ? `wall=${execution.approval.audit.inclusionWallClockMs}ms` : null
+        ].filter(Boolean) as string[], execution.approval.audit?.status === "success" ? "success" : "warn")
+      : formatConsoleLine("approval", ["required=no"], "dim"),
+    formatConsoleLine("sign", [
+      `signed=${execution.swap?.signed ?? execution.signed ? "yes" : "no"}`,
+      execution.swap?.signing ? `signer=${shortAddress(execution.swap.signing.signer)}` : execution.signing ? `signer=${shortAddress(execution.signing.signer)}` : null,
+      execution.swap?.signing ? `nonce=${execution.swap.signing.nonce}` : execution.signing ? `nonce=${execution.signing.nonce}` : null,
+      execution.swap?.signing ? `gas=${execution.swap.signing.gas}` : execution.signing ? `gas=${execution.signing.gas}` : null
+    ].filter(Boolean) as string[], execution.swap?.signed ?? execution.signed ? "success" : "warn"),
+    formatConsoleLine("submit", [
+      `submitted=${execution.swap?.submitted ?? execution.submitted ? "yes" : "no"}`,
+      execution.swap?.submission ? `channel=${execution.swap.submission.channel}` : execution.submission ? `channel=${execution.submission.channel}` : null,
+      execution.swap?.submission ? `accepted=${execution.swap.submission.acceptedCount}/${execution.swap.submission.endpointCount}` : execution.submission ? `accepted=${execution.submission.acceptedCount}/${execution.submission.endpointCount}` : null,
+      execution.swap?.submission?.builderRoundTripMs != null ? `builderMs=${execution.swap.submission.builderRoundTripMs}` : execution.submission?.builderRoundTripMs != null ? `builderMs=${execution.submission.builderRoundTripMs}` : null,
+      execution.swap?.submission?.txHash ? `txHash=${execution.swap.submission.txHash}` : execution.submission?.txHash ? `txHash=${execution.submission.txHash}` : null
+    ].filter(Boolean) as string[], execution.swap?.submitted ?? execution.submitted ? "success" : "warn"),
+    formatConsoleLine("audit", [
+      `status=${execution.swap?.audit?.status ?? execution.audit?.status ?? "skipped"}`,
+      execution.swap?.audit?.blockNumber != null ? `block=${execution.swap.audit.blockNumber}` : execution.audit?.blockNumber != null ? `block=${execution.audit.blockNumber}` : null,
+      execution.swap?.audit?.inclusionBlockDelta != null ? `blocks=${execution.swap.audit.inclusionBlockDelta}` : execution.audit?.inclusionBlockDelta != null ? `blocks=${execution.audit.inclusionBlockDelta}` : null,
+      execution.swap?.audit?.inclusionWallClockMs != null ? `wall=${execution.swap.audit.inclusionWallClockMs}ms` : execution.audit?.inclusionWallClockMs != null ? `wall=${execution.audit.inclusionWallClockMs}ms` : null,
+      execution.swap?.audit?.realizedOut
+        ? `realized=${formatAuditAmount(execution.swap.audit.realizedOut, inferredDecimals, buySymbol)}`
+        : execution.audit?.realizedOut
+          ? `realized=${formatAuditAmount(execution.audit.realizedOut, inferredDecimals, buySymbol)}`
+        : null,
+      execution.swap?.audit?.quoteDeltaRaw
+        ? `vsQuote=${formatSignedAuditDelta(execution.swap.audit.quoteDeltaRaw, inferredDecimals, buySymbol)}`
+        : execution.audit?.quoteDeltaRaw
+          ? `vsQuote=${formatSignedAuditDelta(execution.audit.quoteDeltaRaw, inferredDecimals, buySymbol)}`
+        : null,
+      execution.swap?.audit?.minOutDeltaRaw
+        ? `vsMinOut=${formatSignedAuditDelta(execution.swap.audit.minOutDeltaRaw, inferredDecimals, buySymbol)}`
+        : execution.audit?.minOutDeltaRaw
+          ? `vsMinOut=${formatSignedAuditDelta(execution.audit.minOutDeltaRaw, inferredDecimals, buySymbol)}`
+        : null
+    ].filter(Boolean) as string[]),
+    execution.feedback
+      ? formatConsoleLine(
+          "feedback-pre",
+          execution.feedback.preTradeFindings.length ? execution.feedback.preTradeFindings : ["none"],
+          "dim"
+        )
+      : null,
+    execution.feedback
+      ? formatConsoleLine(
+          "feedback-submit",
+          execution.feedback.submitFindings.length ? execution.feedback.submitFindings : ["none"],
+          execution.feedback.executionQuality === "failed" ? "warn" : "dim"
+        )
+      : null,
+    formatConsoleLine(
+      "feedback-post",
+      execution.feedback
+        ? [
+            ...(
+              execution.feedback.postTradeFindings.length
+                ? execution.feedback.postTradeFindings
+                : ["none"]
+            ),
+            execution.feedback.summaryVerdict
+          ]
+        : [execution.skippedReason ?? "execution was skipped"],
+      execution.feedback?.executionQuality === "failed" ? "warn" : "dim"
+    )
+  ]
+    .filter(Boolean)
+    .join("\n")
 }
 
 export function formatDebugPlan(result: PlanningResult): string {
@@ -195,7 +386,8 @@ export function formatDebugPlan(result: PlanningResult): string {
         alternatives_rejected: result.alternativesRejected,
         public_submit_request: result.publicSubmitRequest,
         private_submit_request: result.privateSubmitRequest,
-        intent_submit_request: result.intentSubmitRequest
+        intent_submit_request: result.intentSubmitRequest,
+        jit_router_request: result.jitRouterRequest
       },
       null,
       2
@@ -228,6 +420,27 @@ export function formatCliStreamingEvent(event: PlanningEvent): string | null {
     return formatConsoleLine("@ quotes", ["querying providers..."], "dim")
   }
 
+  if (event.kind === "tool-started" && event.stage === "liquidity-discovery" && event.data?.toolName === "getQuoteProvider") {
+    const provider = event.data.inputPreview?.find((field) => field.label === "provider")?.value ?? "provider"
+    return formatConsoleLine("quote", [`${provider} started`], "dim")
+  }
+
+  if ((event.kind === "tool-succeeded" || event.kind === "tool-failed") && event.stage === "liquidity-discovery" && event.data?.toolName === "getQuoteProvider") {
+    const provider = event.data.outputPreview?.find((field) => field.label === "provider")?.value ?? "provider"
+    const status = event.data.outputPreview?.find((field) => field.label === "status")?.value ?? (event.kind === "tool-succeeded" ? "observed" : "failed")
+    const latency = event.data.outputPreview?.find((field) => field.label === "latency_ms")?.value
+    const reason = event.data.outputPreview?.find((field) => field.label === "reason")?.value
+    const count = event.data.outputPreview?.find((field) => field.label === "quote_count")?.value
+    const parts = [
+      provider,
+      status === "observed" ? "ok" : status,
+      count && status === "observed" ? `${count} route${count === "1" ? "" : "s"}` : null,
+      latency ? `${latency}ms` : null,
+      reason ? normalizeCliReason(reason) : null
+    ].filter(Boolean) as string[]
+    return formatConsoleLine("quote", parts, status === "observed" ? "success" : "warn")
+  }
+
   if (event.kind === "tool-succeeded" && event.stage === "liquidity-discovery" && event.data?.toolName === "getQuoteCandidates") {
     const queried = event.data.outputPreview?.find((field) => field.label === "queried")?.value
     const seen = event.data.outputPreview?.find((field) => field.label === "seen")?.value
@@ -255,7 +468,7 @@ export function formatCliStreamingEvent(event: PlanningEvent): string | null {
     return [
       kept ? formatConsoleLine("kept", [kept], "success") : null,
       hold ? formatConsoleLine("hold", [hold], "dim") : null,
-      hold ? formatConsoleLine("note", ["kept=top payload-build candidates; hold=observed only"], "dim") : null
+      formatConsoleLine("rule", ["kept=top quoted candidates built this round; native/buildable wins ties"], "dim")
     ]
       .filter(Boolean)
       .join("\n")
@@ -271,8 +484,13 @@ export function formatCliStreamingEvent(event: PlanningEvent): string | null {
   }
 
   if (event.kind === "tool-succeeded" && event.stage === "payload-construction" && event.data?.toolName === "simulateTransaction") {
-    const gas = event.data.outputPreview?.find((field) => field.label === "estimated_gas")?.value ?? "0"
-    return formatConsoleLine("sim ok", [`gas=${gas}`], "success")
+    const gas = event.data.outputPreview?.find((field) => field.label === "estimated_gas")?.value
+    const result = event.data.outputPreview?.find((field) => field.label === "result")?.value
+    return formatConsoleLine(
+      "sim",
+      [result === "approval-required" ? "approval-required" : "ok", `gas=${displayGas(gas)}`],
+      "success"
+    )
   }
 
   if (event.kind === "tool-failed" && event.stage === "payload-construction" && event.data?.toolName === "simulateTransaction") {
@@ -288,11 +506,29 @@ export function formatCliStreamingEvent(event: PlanningEvent): string | null {
   }
 
   if (event.kind === "tool-succeeded" && event.stage === "submission-strategy" && event.data?.toolName === "getSubmissionPaths") {
+    const selected = event.data.outputPreview?.find((field) => field.label === "selected")?.value
     const order = ["public", "private", "builder", "intent"]
-    return [...(event.data.outputPreview ?? [])]
+    const lines = [...(event.data.outputPreview ?? [])]
+      .filter((field) => field.label !== "selected")
       .sort((a, b) => order.indexOf(a.label) - order.indexOf(b.label))
       .map((field) => formatConsoleLine(field.label, [field.value], field.label === "public" ? "success" : "warn"))
-      .join("\n")
+    if (selected) {
+      lines.unshift(formatConsoleLine("path", [selected], "success"))
+    }
+    return lines.join("\n")
+  }
+
+  if (event.kind === "tool-succeeded" && event.stage === "liquidity-discovery" && event.data?.toolName === "checkAllowance") {
+    const status = event.data.outputPreview?.find((field) => field.label === "allowance")?.value ?? "unknown"
+    const spender = event.data.outputPreview?.find((field) => field.label === "spender")?.value
+    const current = event.data.outputPreview?.find((field) => field.label === "current")?.value
+    const required = event.data.outputPreview?.find((field) => field.label === "required")?.value
+    const note = event.data.outputPreview?.find((field) => field.label === "note")?.value
+    return formatConsoleLine(
+      "allow",
+      [status, spender ? `spender=${shortAddress(spender)}` : null, current ? `current=${shortAmount(current)}` : null, required ? `required=${shortAmount(required)}` : null, note ?? null].filter(Boolean) as string[],
+      status === "approve-required" ? "warn" : status === "ok" || status === "not-applicable" ? "success" : "dim"
+    )
   }
 
   if (event.kind === "stage-completed" && event.stage === "submission-strategy") {
@@ -348,7 +584,7 @@ export function formatCliCheckpoint(input: {
   }
 
   if (input.checkpoint === "tokens") {
-    const tokenFields = collectFields(input.events, ["liquidity-discovery"], ["symbol", "address"])
+    const tokenFields = collectFields(input.events, ["liquidity-discovery"], ["symbol", "address", "resolved", "normalized"])
     const resolvedSymbols = new Set(
       tokenFields.filter((field) => field.label === "symbol").map((field) => field.value)
     )
@@ -386,8 +622,8 @@ export function formatCliCheckpoint(input: {
       formatConsoleLine("seen", [observed || "none"], observed ? "success" : "warn"),
       formatConsoleLine("kept", [kept || "none"], kept ? "success" : "warn"),
       held ? formatConsoleLine("hold", [held], "dim") : null,
-      held ? formatConsoleLine("note", ["kept=top payload-build candidates; hold=observed only"], "dim") : null,
       dropped ? formatConsoleLine("drop", [dropped], "warn") : null,
+      formatConsoleLine("rule", ["kept=top quoted candidates built this round; native/buildable wins ties"], "dim")
     ]
       .filter(Boolean)
       .join("\n")
@@ -431,15 +667,25 @@ export function formatCliCheckpoint(input: {
     const result = input.result
     if (!result) return null
     const liveRoutes = result.routeExecutionReadiness.filter((item) => item.liveExecutable).map((item) => item.routeId)
+    const readyMessage =
+      result.recommendedHandoff === "private-rpc-handoff"
+        ? "private raw-tx handoff ready"
+        : result.recommendedHandoff === "builder-broadcast-handoff"
+          ? "builder broadcast handoff ready"
+          : liveRoutes.length
+            ? "public wallet handoff ready"
+            : "no live-executable route yet"
+    const noteMessage =
+      result.recommendedHandoff === "private-rpc-handoff" || result.recommendedHandoff === "builder-broadcast-handoff"
+        ? "sign locally, then submit signed raw tx via private delivery"
+        : "private paths observed and ranked, not live-integrated"
     return [
       formatConsoleLine(
         "ready",
-        [
-          liveRoutes.length ? "public execution can be prepared now" : "no live-executable route yet",
-          "private paths observed and ranked, not live-integrated"
-        ],
-        liveRoutes.length ? "success" : "warn"
+        [readyMessage],
+        readyMessage === "no live-executable route yet" ? "warn" : "success"
       ),
+      formatConsoleLine("note", [noteMessage], "dim"),
       formatConsoleLine("boundary", ["planner builds/checks, user signs"], "dim")
     ].join("\n")
   }
@@ -576,4 +822,51 @@ function shortAmount(value: string): string {
 function formatTxValue(value: string, symbol?: string): string {
   if (value === "0") return symbol ? `0 ${symbol}` : "0"
   return symbol ? `${Number(value) / 1e18} ${symbol}` : value
+}
+
+function formatUnits(raw: string, decimals: number): string {
+  const normalized = raw.replace(/^(-?)(\d+)$/, "$1$2")
+  const sign = normalized.startsWith("-") ? "-" : ""
+  const digits = sign ? normalized.slice(1) : normalized
+  const padded = digits.padStart(decimals + 1, "0")
+  const head = padded.slice(0, -decimals) || "0"
+  const tail = padded.slice(-decimals).replace(/0+$/, "")
+  return tail ? `${sign}${head}.${tail}` : `${sign}${head}`
+}
+
+function trimFloat(value: string): string {
+  return value.replace(/(\.\d*?)0+$/, "$1").replace(/\.$/, "")
+}
+
+function inferDecimalsFromQuote(raw: string, formatted: string): number | null {
+  const numeric = formatted.split(" ")[0]?.trim()
+  if (!numeric) return null
+  for (let decimals = 0; decimals <= 36; decimals += 1) {
+    if (trimFloat(formatUnits(raw, decimals)) === numeric) {
+      return decimals
+    }
+  }
+  return null
+}
+
+function formatAuditAmount(raw: string, decimals: number | null, symbol: string): string {
+  if (decimals == null) {
+    return `${shortAmount(raw)} ${symbol}`
+  }
+  return `${trimFloat(formatUnits(raw, decimals))} ${symbol}`
+}
+
+function formatSignedAuditDelta(raw: string, decimals: number | null, symbol: string): string {
+  if (decimals == null) {
+    const prefix = raw.startsWith("-") ? "" : "+"
+    return `${prefix}${shortAmount(raw)} ${symbol}`
+  }
+  const formatted = trimFloat(formatUnits(raw, decimals))
+  const prefix = formatted.startsWith("-") ? "" : "+"
+  return `${prefix}${formatted} ${symbol}`
+}
+
+function displayGas(value: string | undefined): string {
+  if (!value || value === "0") return "unknown"
+  return value
 }

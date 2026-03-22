@@ -215,6 +215,7 @@ export interface QuoteProviderAuditEntry {
   reason?: string
   rawReason?: string
   quoteCount: number
+  latencyMs?: number
 }
 
 export interface PriceImpactAssessment {
@@ -422,14 +423,50 @@ export interface PrivateSubmissionRequest {
   submissionFamily: SubmissionChannel
   providerName: string
   liveStatus: "live" | "advisory" | "info-only"
+  preferredChannel?: "validator" | "builder" | "both"
   method?: "eth_sendRawTransaction"
   endpointType?: "validator-mev-rpc" | "builder-relay" | "mixed"
   suggestedTargets?: PrivateSubmissionTarget[]
   recommendedTargetCount?: number
   whyChosen: string
   requiredCapabilities: string[]
+  userAction?: string
+  cliCommand?: string
   note: string
   guardrails: Guardrail[]
+}
+
+export interface JitRouterRequestCandidate {
+  routeId: string
+  payloadId: string
+  adapterId: number
+  router: string
+  callData: string
+  value: string
+  minOutAmount: string
+}
+
+export interface JitRouterOrder {
+  user: string
+  recipient: string
+  tokenIn: string
+  tokenOut: string
+  amountIn: string
+  minOutAmount: string
+  maxBlockNumber: string
+  nonce: string
+  candidateSetHash: string
+}
+
+export interface JitRouterRequest {
+  mode: "jit-router"
+  network: Network
+  routerAddress: string
+  payloadType: "jit-router-calldata"
+  order: JitRouterOrder
+  approvalSpender: string
+  candidates: JitRouterRequestCandidate[]
+  note: string
 }
 
 export interface PrivateSubmissionResult {
@@ -447,16 +484,82 @@ export interface ExecutionAudit {
   txHash: string
   chainId: number
   blockNumber?: bigint
+  inclusionBlockDelta?: number
   status: "success" | "reverted" | "pending" | "not-found"
   gasUsed?: bigint
   effectiveGasPrice?: bigint
   inclusionLatencyMs?: number
+  inclusionWallClockMs?: number
+  chainTimestampDeltaMs?: number
   buyTokenAddress?: string
   recipient?: string
   expectedOut?: string
+  expectedQuoteOut?: string
+  protectedMinOut?: string
   realizedOut?: string
   realizedDelta?: string
+  quoteDeltaRaw?: string
+  minOutDeltaRaw?: string
   executionPath?: "public-mempool" | "private-rpc" | "builder-aware-broadcast" | "unknown"
+}
+
+export interface SwapExecutionSigningSummary {
+  signer: string
+  nonce: string
+  gas: string
+  gasPrice: string
+  rawTransaction: string
+}
+
+export interface SwapExecutionSubmissionSummary {
+  channel: "builder"
+  endpointCount: number
+  acceptedCount: number
+  txHash?: string
+  submittedAt: string
+  submittedBlockNumber?: string
+  startedAtMonotonicMs?: number
+  firstAcceptedAtMonotonicMs?: number
+  builderRoundTripMs?: number
+  acceptedEndpointId?: string
+  acceptedEndpointName?: string
+  results: PrivateSubmissionResult[]
+}
+
+export interface SwapExecutionFeedback {
+  timeliness: "good" | "weak" | "unknown"
+  priceProtection: "held" | "within-guardrail" | "failed" | "unknown"
+  executionQuality: "good" | "failed" | "pending"
+  mevProtectionAssessment: "private-builder-path-used" | "private-builder-path-unavailable" | "not-submitted"
+  preTradeFindings: string[]
+  submitFindings: string[]
+  postTradeFindings: string[]
+  summaryVerdict: string
+  notes: string[]
+}
+
+export interface SwapExecutionPhaseSummary {
+  signed: boolean
+  submitted: boolean
+  skippedReason?: string
+  signing?: SwapExecutionSigningSummary
+  submission?: SwapExecutionSubmissionSummary
+  audit?: ExecutionAudit
+}
+
+export interface SwapExecutionSummary {
+  mode: "live" | "dry-run"
+  recommendedHandoff: "builder-broadcast-handoff" | "none"
+  executionVariant?: "jit-v21" | "direct-router"
+  signed: boolean
+  submitted: boolean
+  skippedReason?: string
+  approval?: SwapExecutionPhaseSummary
+  swap?: SwapExecutionPhaseSummary
+  signing?: SwapExecutionSigningSummary
+  submission?: SwapExecutionSubmissionSummary
+  audit?: ExecutionAudit
+  feedback?: SwapExecutionFeedback
 }
 
 export interface IntentSubmissionRequest {
@@ -558,6 +661,15 @@ export interface RouteExecutionReadiness {
   liveExecutable: boolean
 }
 
+export interface AllowanceCheckSummary {
+  status: "ok" | "approve-required" | "not-applicable" | "unavailable"
+  spender?: string
+  token?: string
+  currentAllowance?: string
+  requiredAmount?: string
+  note?: string
+}
+
 export interface PresentationRouteCard {
   routeId: string
   provider: string
@@ -615,6 +727,14 @@ export function toUserFacingErrorMessage(error: string): string {
     return "Live planning is unavailable because the BSC RPC URL is not configured."
   }
 
+  if (trimmed.includes("Missing PRIVATE_KEY")) {
+    return "Live execution is unavailable because PRIVATE_KEY is not configured."
+  }
+
+  if (trimmed.includes("does not match DEMO_WALLET_ADDRESS")) {
+    return "PRIVATE_KEY does not match DEMO_WALLET_ADDRESS."
+  }
+
   if (trimmed.includes("transfer amount exceeds balance")) {
     return "The selected wallet does not hold enough of the sell token for this swap simulation."
   }
@@ -628,6 +748,11 @@ export function toUserFacingErrorMessage(error: string): string {
 
   if (trimmed.includes("Streaming request failed")) {
     return "The planner request failed before live updates could start."
+  }
+
+  const tokenSuggestionMatch = trimmed.match(/^Could not resolve token '(.+)' on ([a-z-]+)\.\s*suggest\s+(.+)$/i)
+  if (tokenSuggestionMatch) {
+    return `Could not resolve token '${tokenSuggestionMatch[1]}' on ${tokenSuggestionMatch[2]}. Did you mean ${tokenSuggestionMatch[3]}?`
   }
 
   return trimmed
@@ -692,13 +817,16 @@ export interface PlanningResult {
   defaultSelectedRouteId: string
   effectiveSlippageBps: number
   executionReadyNow: boolean
+  recommendedHandoff: "public-wallet" | "private-rpc-handoff" | "builder-broadcast-handoff" | "none"
   bestQuoteRouteId: string | null
   bestReadyRouteId: string | null
   routeExecutionReadiness: RouteExecutionReadiness[]
+  allowanceCheck?: AllowanceCheckSummary
   alternativesRejected: AlternativeRejected[]
   publicSubmitRequest?: PublicTransactionRequest
   privateSubmitRequest?: PrivateSubmissionRequest
   intentSubmitRequest?: IntentSubmissionRequest
+  jitRouterRequest?: JitRouterRequest
 }
 
 export interface FollowUpResponse {
@@ -770,8 +898,8 @@ export function createPresentationResult(result: PlanningResult): PresentationRe
     : "I built a payload and checked both route quality and execution constraints before surfacing the live options."
 
   const recommendationSummary = selectedRoute
-    ? `For this request, the preferred live execution is public wallet broadcast, while private paths remain advisory. The default evidence route is ${selectedRoute.platform}.`
-    : "For this request, the preferred live execution is public wallet broadcast, while private paths remain advisory."
+    ? `For this request, the preferred handoff is ${describeRecommendedHandoff(result.recommendedHandoff)}, and the default evidence route is ${selectedRoute.platform}.`
+    : `For this request, the preferred handoff is ${describeRecommendedHandoff(result.recommendedHandoff)}.`
 
   const submissionSummary = buildSubmissionSummary(result)
   const executionCapabilitySummary = buildExecutionCapabilitySummary(result)
@@ -839,8 +967,8 @@ export function createPresentationResult(result: PlanningResult): PresentationRe
         title: "What I recommend",
         observed: recommendationSummary,
         decided: selectedRoute
-          ? `I would prepare public execution first and keep private paths as preferred advisory options until relay integration is live.`
-          : "I would prepare public execution first and keep private paths advisory.",
+          ? `I would prepare the recommended handoff next and keep JIT as an experimental fallback payload only.`
+          : "I would prepare the recommended handoff next and keep JIT experimental only.",
         whyItMatters: boundarySummary
       }
     ],
@@ -962,9 +1090,18 @@ function buildQuoteConfidenceSummary(
 function buildSubmissionSummary(result: PlanningResult): string {
   const publicCandidate = result.submissionCandidates.find((candidate) => candidate.submissionChannel === "public-mempool")
   const privateCandidate = result.submissionCandidates.find((candidate) => candidate.submissionChannel === "private-rpc")
+  const builderCandidate = result.submissionCandidates.find((candidate) => candidate.submissionChannel === "builder-aware-broadcast")
   const lines = [
-    publicCandidate ? "Public wallet execution is the live handoff path for this demo." : null,
-    privateCandidate ? `${privateCandidate.providerName} remains a preferred advisory path only.` : null
+    result.recommendedHandoff === "public-wallet"
+      ? "Public wallet execution is the recommended handoff path for this demo."
+      : result.recommendedHandoff === "private-rpc-handoff"
+        ? "Private validator RPC handoff is the recommended next step after local signing."
+        : result.recommendedHandoff === "builder-broadcast-handoff"
+          ? "Builder relay handoff is the recommended next step after local signing."
+          : null,
+    publicCandidate ? "Public wallet handoff remains available." : null,
+    privateCandidate ? `${privateCandidate.providerName} can accept a signed raw transaction.` : null,
+    builderCandidate ? `${builderCandidate.providerName} can broadcast a signed raw transaction across relays.` : null
   ]
   return lines.filter(Boolean).join(" ")
 }
@@ -1039,10 +1176,25 @@ function deriveSubmissionCompatibility(result: PlanningResult, route: RouteCandi
   const hasLivePublic = result.routeExecutionReadiness.some(
     (item) => item.routeId === route.id && item.liveExecutable
   )
+  if (result.recommendedHandoff === "private-rpc-handoff") {
+    return "private handoff preferred + public fallback"
+  }
+  if (result.recommendedHandoff === "builder-broadcast-handoff") {
+    return "builder handoff preferred + public fallback"
+  }
   if (hasLivePublic) {
-    return "live public + advisory private"
+    return "public handoff preferred + private available"
   }
   return "advisory only"
+}
+
+function describeRecommendedHandoff(
+  handoff: PlanningResult["recommendedHandoff"]
+): string {
+  if (handoff === "private-rpc-handoff") return "private validator RPC handoff"
+  if (handoff === "builder-broadcast-handoff") return "builder relay handoff"
+  if (handoff === "public-wallet") return "public wallet handoff"
+  return "no live handoff"
 }
 
 function orderObservedRoutes(result: PlanningResult): RouteCandidate[] {

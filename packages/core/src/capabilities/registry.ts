@@ -28,7 +28,8 @@ import type {
   ChainCapabilityAdapter,
   MarketIntelligenceAdapter,
   QuoteCapabilityAdapter,
-  SubmissionCapabilityAdapter
+  SubmissionCapabilityAdapter,
+  TokenResolutionResult
 } from "./types"
 import {
   loadPrivateSubmissionRegistry,
@@ -246,6 +247,18 @@ interface OpenOceanTokenListResponse {
   }>
 }
 
+interface TokenListEntry extends TokenRef {
+  name?: string
+}
+
+const BSC_TOKEN_ALIASES: Record<string, string> = {
+  cake: "CAKE",
+  caketoken: "CAKE",
+  pancaketoken: "CAKE",
+  pancakeswaptoken: "CAKE",
+  pancakeswaptokens: "CAKE"
+}
+
 interface OpenOceanQuoteResponse {
   code: number
   data?: {
@@ -371,7 +384,7 @@ interface DefiLlamaDexSummaryResponse {
 
 class BnbMcpChainAdapter implements ChainCapabilityAdapter {
   private readonly mcp = new Client({ name: "bsc-swap-agent-demo", version: "0.2.0" })
-  private readonly tokenCache = new Map<Network, TokenRef[]>()
+  private readonly tokenCache = new Map<Network, TokenListEntry[]>()
   private connected = false
 
   async listTools(): Promise<string[]> {
@@ -397,24 +410,80 @@ class BnbMcpChainAdapter implements ChainCapabilityAdapter {
   }
 
   async resolveToken(query: string, network: Network): Promise<TokenRef | null> {
-    const normalized = query.trim().toUpperCase()
-    if (normalized === "BNB") {
+    const result = await this.resolveTokenDetailed(query, network)
+    return result.resolvedToken
+  }
+
+  async resolveTokenDetailed(query: string, network: Network): Promise<TokenResolutionResult> {
+    const normalizedUpper = query.trim().toUpperCase()
+    const normalizedQuery = normalizeTokenQuery(query)
+    const nativeBnb = {
+      symbol: "BNB",
+      address: BNB_NATIVE_SENTINEL,
+      decimals: 18,
+      isNative: true
+    } satisfies TokenRef
+
+    if (normalizedUpper === "BNB" || normalizedQuery === "bnb") {
       return {
-        symbol: "BNB",
-        address: BNB_NATIVE_SENTINEL,
-        decimals: 18,
-        isNative: true
+        resolvedToken: nativeBnb,
+        resolvedBy: "exact-symbol",
+        normalizedQuery: "BNB",
+        suggestions: []
       }
     }
 
     const list = await this.getTokenList(network)
-    return (
-      list.find(
-        (token) =>
-          token.symbol.toUpperCase() === normalized ||
-          token.address.toLowerCase() === query.toLowerCase()
-      ) ?? null
-    )
+    const exactSymbol = list.find((token) => token.symbol.toUpperCase() === normalizedUpper)
+    if (exactSymbol) {
+      return {
+        resolvedToken: toTokenRef(exactSymbol),
+        resolvedBy: "exact-symbol",
+        normalizedQuery: exactSymbol.symbol,
+        suggestions: []
+      }
+    }
+
+    const exactAddress = list.find((token) => token.address.toLowerCase() === query.toLowerCase())
+    if (exactAddress) {
+      return {
+        resolvedToken: toTokenRef(exactAddress),
+        resolvedBy: "exact-address",
+        normalizedQuery: exactAddress.address,
+        suggestions: []
+      }
+    }
+
+    const aliasSymbol = BSC_TOKEN_ALIASES[normalizedQuery]
+    if (aliasSymbol) {
+      const aliasToken = list.find((token) => token.symbol.toUpperCase() === aliasSymbol)
+      if (aliasToken) {
+        return {
+          resolvedToken: toTokenRef(aliasToken),
+          resolvedBy: "alias",
+          normalizedQuery: aliasSymbol,
+          suggestions: []
+        }
+      }
+    }
+
+    const exactName = list.find((token) => normalizeTokenQuery(token.name ?? "") === normalizedQuery)
+    if (exactName) {
+      return {
+        resolvedToken: toTokenRef(exactName),
+        resolvedBy: "name-match",
+        normalizedQuery,
+        suggestions: []
+      }
+    }
+
+    const suggestions = rankTokenSuggestions(list, normalizedQuery).slice(0, 3).map(toTokenRef)
+    return {
+      resolvedToken: null,
+      resolvedBy: "unresolved",
+      normalizedQuery,
+      suggestions
+    }
   }
 
   async estimateGas(input: {
@@ -478,7 +547,7 @@ class BnbMcpChainAdapter implements ChainCapabilityAdapter {
     return JSON.parse(text)
   }
 
-  private async getTokenList(network: Network): Promise<TokenRef[]> {
+  private async getTokenList(network: Network): Promise<TokenListEntry[]> {
     const cached = this.tokenCache.get(network)
     if (cached) {
       return cached
@@ -494,7 +563,8 @@ class BnbMcpChainAdapter implements ChainCapabilityAdapter {
     const list = response.data.map((token) => ({
       symbol: token.symbol,
       address: token.address,
-      decimals: token.decimals
+      decimals: token.decimals,
+      name: token.name
     }))
     this.tokenCache.set(network, list)
     return list
@@ -1695,6 +1765,7 @@ class MultiProviderQuoteAdapter implements QuoteCapabilityAdapter {
             isNativeAdapterReady(venue.id)
         )
         .map(async (venue) => {
+          const startedAt = Date.now()
           const adapter = this.nativeAdapters[venue.id]
           if (!adapter) {
             return {
@@ -1706,7 +1777,8 @@ class MultiProviderQuoteAdapter implements QuoteCapabilityAdapter {
                 status: "failed",
                 reason: "adapter-missing",
                 rawReason: "adapter-missing",
-                quoteCount: 0
+                quoteCount: 0,
+                latencyMs: Date.now() - startedAt
               })
             }
           }
@@ -1721,7 +1793,8 @@ class MultiProviderQuoteAdapter implements QuoteCapabilityAdapter {
                 status: "unsupported",
                 reason: preflightReason,
                 rawReason: preflightReason,
-                quoteCount: 0
+                quoteCount: 0,
+                latencyMs: Date.now() - startedAt
               })
             }
           }
@@ -1736,7 +1809,8 @@ class MultiProviderQuoteAdapter implements QuoteCapabilityAdapter {
                 status: candidates.length ? "observed" : "empty",
                 reason: candidates.length ? undefined : "no-quote-returned",
                 rawReason: candidates.length ? undefined : "no-quote-returned",
-                quoteCount: candidates.length
+                quoteCount: candidates.length,
+                latencyMs: Date.now() - startedAt
               })
             }
           } catch (error) {
@@ -1749,7 +1823,8 @@ class MultiProviderQuoteAdapter implements QuoteCapabilityAdapter {
                 status: "failed",
                 reason: summarizeQuoteError(error),
                 rawReason: rawQuoteError(error),
-                quoteCount: 0
+                quoteCount: 0,
+                latencyMs: Date.now() - startedAt
               })
             }
           }
@@ -1760,6 +1835,7 @@ class MultiProviderQuoteAdapter implements QuoteCapabilityAdapter {
       CURATED_BSC_VENUE_UNIVERSE.dexs
         .filter((venue) => venue.included && isDirectDexAdapterReady(venue.id))
         .map(async (venue) => {
+          const startedAt = Date.now()
           const adapter = this.directDexAdapters[venue.id]
           if (!adapter) {
             return {
@@ -1771,7 +1847,8 @@ class MultiProviderQuoteAdapter implements QuoteCapabilityAdapter {
                 status: "failed",
                 reason: "adapter-missing",
                 rawReason: "adapter-missing",
-                quoteCount: 0
+                quoteCount: 0,
+                latencyMs: Date.now() - startedAt
               })
             }
           }
@@ -1786,7 +1863,8 @@ class MultiProviderQuoteAdapter implements QuoteCapabilityAdapter {
                 status: "unsupported",
                 reason: preflightReason,
                 rawReason: preflightReason,
-                quoteCount: 0
+                quoteCount: 0,
+                latencyMs: Date.now() - startedAt
               })
             }
           }
@@ -1801,7 +1879,8 @@ class MultiProviderQuoteAdapter implements QuoteCapabilityAdapter {
                 status: candidates.length ? "observed" : "empty",
                 reason: candidates.length ? undefined : "no-route-returned",
                 rawReason: candidates.length ? undefined : "no-route-returned",
-                quoteCount: candidates.length
+                quoteCount: candidates.length,
+                latencyMs: Date.now() - startedAt
               })
             }
           } catch (error) {
@@ -1814,7 +1893,8 @@ class MultiProviderQuoteAdapter implements QuoteCapabilityAdapter {
                 status: "failed",
                 reason: summarizeQuoteError(error),
                 rawReason: rawQuoteError(error),
-                quoteCount: 0
+                quoteCount: 0,
+                latencyMs: Date.now() - startedAt
               })
             }
           }
@@ -1826,6 +1906,7 @@ class MultiProviderQuoteAdapter implements QuoteCapabilityAdapter {
       .map((venue) => venue.id)
     let modeledCandidates: RouteCandidate[] = []
     let modeledAudit: import("@bsc-swap-agent-demo/shared").QuoteProviderAuditEntry[] = []
+    const modeledStartedAt = Date.now()
     try {
       modeledCandidates = await this.modeledFallbackAdapter.getQuoteCandidates(input)
       modeledAudit = modeledVenueIds.map((providerId) =>
@@ -1836,7 +1917,8 @@ class MultiProviderQuoteAdapter implements QuoteCapabilityAdapter {
           status: modeledCandidates.some((candidate) => candidate.id === providerId) ? "observed" : "empty",
           reason: modeledCandidates.some((candidate) => candidate.id === providerId) ? undefined : "no-modeled-quote",
           rawReason: modeledCandidates.some((candidate) => candidate.id === providerId) ? undefined : "no-modeled-quote",
-          quoteCount: modeledCandidates.filter((candidate) => candidate.id === providerId).length
+          quoteCount: modeledCandidates.filter((candidate) => candidate.id === providerId).length,
+          latencyMs: Date.now() - modeledStartedAt
         })
       )
     } catch (error) {
@@ -1848,7 +1930,8 @@ class MultiProviderQuoteAdapter implements QuoteCapabilityAdapter {
           status: "failed",
           reason: summarizeQuoteError(error),
           rawReason: rawQuoteError(error),
-          quoteCount: 0
+          quoteCount: 0,
+          latencyMs: Date.now() - modeledStartedAt
         })
       )
     }
@@ -2333,6 +2416,39 @@ function normalizeDexName(value: string): string {
     .replace(/^solidlyv3/, "solidly")
 }
 
+function normalizeTokenQuery(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]/g, "")
+}
+
+function toTokenRef(token: TokenListEntry): TokenRef {
+  return {
+    symbol: token.symbol,
+    address: token.address,
+    decimals: token.decimals,
+    isNative: token.isNative
+  }
+}
+
+function rankTokenSuggestions(list: TokenListEntry[], normalizedQuery: string): TokenListEntry[] {
+  const scored = list
+    .map((token) => {
+      const normalizedSymbol = normalizeTokenQuery(token.symbol)
+      const normalizedName = normalizeTokenQuery(token.name ?? "")
+      let score = 0
+      if (normalizedName === normalizedQuery) score += 100
+      if (normalizedSymbol === normalizedQuery) score += 95
+      if (normalizedName.includes(normalizedQuery) && normalizedQuery.length >= 3) score += 60
+      if (normalizedQuery.includes(normalizedName) && normalizedName.length >= 3) score += 55
+      if (normalizedSymbol.includes(normalizedQuery) && normalizedQuery.length >= 2) score += 50
+      if (normalizedQuery.includes(normalizedSymbol) && normalizedSymbol.length >= 2) score += 45
+      return { token, score }
+    })
+    .filter((entry) => entry.score > 0)
+    .sort((a, b) => b.score - a.score || a.token.symbol.length - b.token.symbol.length || a.token.symbol.localeCompare(b.token.symbol))
+
+  return scored.map((entry) => entry.token)
+}
+
 function normalizeZeroXFills(fills: ZeroXRouteFill[]): Array<{ dexCode: string; shareBps: number }> {
   return fills
     .map((fill) => ({
@@ -2643,6 +2759,7 @@ function buildQuoteAuditEntry(input: {
   reason?: string
   rawReason?: string
   quoteCount: number
+  latencyMs?: number
 }) {
   return input
 }
