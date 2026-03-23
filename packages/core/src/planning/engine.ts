@@ -16,6 +16,7 @@ import type {
   PlanningSessionState,
   PriceImpactAssessment,
   RouteCandidate,
+  SelectionReasonCode,
   SkillContext,
   SkillResponse,
   StructuredIntent,
@@ -50,16 +51,6 @@ export async function* runPlanningStream(input: {
 
   const priorEvents = [...(input.state?.events ?? [])]
   const stageSummarizer = input.stageSummarizer ?? summarizeStageWithLLM
-  const intent = input.state?.intent ?? await (input.intentExtractor ?? extractIntent)(input.message)
-  const state =
-    input.state ??
-    ({
-      rawInput: input.message,
-      intent,
-      missingFieldsResolved: [],
-      events: priorEvents
-    } satisfies PlanningSessionState)
-
   if (!input.state) {
     yield emit({
       stage: "intent-parsing",
@@ -71,6 +62,35 @@ export async function* runPlanningStream(input: {
         inputPreview: [{ label: "raw_input", value: input.message }]
       }
     })
+  }
+
+  let intent: StructuredIntent
+  try {
+    intent = input.state?.intent ?? await (input.intentExtractor ?? extractIntent)(input.message)
+  } catch (error) {
+    if (!input.state) {
+      yield emit({
+        stage: "intent-parsing",
+        kind: "stage-failed",
+        status: "failed",
+        message: error instanceof Error ? error.message : String(error),
+        data: {
+          title: "Intent parsing"
+        }
+      })
+    }
+    throw error
+  }
+  const state =
+    input.state ??
+    ({
+      rawInput: input.message,
+      intent,
+      missingFieldsResolved: [],
+      events: priorEvents
+    } satisfies PlanningSessionState)
+
+  if (!input.state) {
     yield emit({
       stage: "intent-parsing",
       kind: "reasoning",
@@ -481,6 +501,18 @@ export async function* runPlanningStream(input: {
   const mevRiskAssessment = assessMevRisk(routeCandidatesObserved, state.intent)
   const routeCandidates = scoreRoutes(routeCandidatesObserved, mevRiskAssessment, state.intent)
   let recommendedRoute = routeCandidates[0]
+  const priceImpactAssessment = buildPriceImpactAssessment(routeCandidates)
+  const payloadDecisionSet = buildPayloadDecisionSet({
+    routeCandidates,
+    bestQuotedRouteId: priceImpactAssessment.bestQuotedRouteId
+  })
+  const excludedRouteIds = routeCandidates
+    .map((candidate) => candidate.id)
+    .filter((candidateId) => !payloadDecisionSet.some((candidate) => candidate.id === candidateId))
+  const finalistSelectionSummary = buildFinalistSelectionSummary({
+    finalists: payloadDecisionSet.map((candidate) => candidate.id),
+    excludedRouteIds
+  })
   for (const event of await buildStageReasoningEvents({
     emit,
     stage: "route-comparison",
@@ -491,10 +523,7 @@ export async function* runPlanningStream(input: {
         label: candidate.id,
         value: `score=${candidate.score.toFixed(4)}, impact=${candidate.priceImpactPct.toFixed(3)}%, mev=${candidate.mevExposure}, coverage=${candidate.coverageConfidence}`
       })),
-      decision: `Keep ${routeCandidates
-        .slice(0, 2)
-        .map((candidate) => candidate.id)
-        .join(", ")} for payload preparation.`,
+      decision: `Keep ${payloadDecisionSet.map((candidate) => candidate.id).join(", ")} for payload preparation because they are the top quoted routes this round.`,
       artifacts: routeCandidates.slice(1).map((candidate) => ({
         label: candidate.id,
         value: candidate.rejectionReason ?? "lower execution score"
@@ -531,13 +560,13 @@ export async function* runPlanningStream(input: {
     message: "Starting payload construction and simulation.",
     data: {
       title: "Payload construction",
-      inputPreview: [{ label: "candidate_count", value: String(Math.min(2, routeCandidates.length)) }]
+      inputPreview: [{ label: "candidate_count", value: String(payloadDecisionSet.length) }]
     }
   })
 
   const payloadCandidates: PayloadCandidate[] = []
   const payloadFailures: Array<{ routeId: string; reason: string }> = []
-  for (const [index, candidate] of routeCandidates.slice(0, 2).entries()) {
+  for (const [index, candidate] of payloadDecisionSet.entries()) {
     yield emit({
       stage: "payload-construction",
       kind: "tool-started",
@@ -729,7 +758,6 @@ export async function* runPlanningStream(input: {
     status: "running",
     message: "Assessing quoted output versus price impact."
   })
-  const priceImpactAssessment = buildPriceImpactAssessment(routeCandidates)
   for (const event of await buildStageReasoningEvents({
     emit,
     stage: "price-impact-assessment",
@@ -1217,6 +1245,45 @@ export async function* runPlanningStream(input: {
     events: []
   }
 
+  const routeExecutionReadiness = routeCandidates.map((candidate) => {
+    const payloadCandidate = payloadCandidates.find(
+      (payload) => payload.platform === candidate.platform && payload.routeFamily === candidate.routeFamily
+    )
+    const simulationOk = payloadCandidate?.simulation.ok ?? false
+    return {
+      routeId: candidate.id,
+      payloadReady: Boolean(payloadCandidate),
+      simulationOk,
+      liveExecutable: Boolean(
+        payloadCandidate &&
+          simulationOk &&
+          payloadCandidate.executionMode === "self-executed" &&
+          submissionCandidates.some(
+            (submission) =>
+              submission.submissionChannel === "public-mempool" &&
+              submission.liveStatus === "live" &&
+              submission.routeFamilies.includes(candidate.routeFamily)
+          )
+      )
+    }
+  })
+  const bestReadyRouteId = routeCandidates.find((candidate) =>
+    payloadCandidates.some(
+      (payloadCandidate) =>
+        payloadCandidate.platform === candidate.platform &&
+        payloadCandidate.routeFamily === candidate.routeFamily &&
+        payloadCandidate.simulation.ok
+    )
+  )?.id ?? null
+  const selectionReason = deriveSelectionReason({
+    bestQuoteRouteId: priceImpactAssessment.bestQuotedRouteId,
+    bestReadyRouteId,
+    selectedRouteId: bestExecutionPackage.routeId,
+    bestExecutionPackage,
+    routeCandidates,
+    payloadCandidates
+  })
+
   const result = attachSubmissionRequests({
     network: input.context.network,
     walletAddress: input.context.walletAddress,
@@ -1290,38 +1357,18 @@ export async function* runPlanningStream(input: {
           (submission) => submission.submissionChannel === "public-mempool" && submission.liveStatus === "live"
         ),
       recommendedHandoff: "none",
+      executionRecommendationMode: "direct-route",
       bestQuoteRouteId: priceImpactAssessment.bestQuotedRouteId,
-      bestReadyRouteId: routeCandidates.find((candidate) =>
-        payloadCandidates.some(
-          (payloadCandidate) =>
-            payloadCandidate.platform === candidate.platform &&
-            payloadCandidate.routeFamily === candidate.routeFamily &&
-            payloadCandidate.simulation.ok
-        )
-      )?.id ?? null,
+      bestExecutableRouteId: bestExecutionPackage.routeId,
+      finalistsRouteIds: payloadDecisionSet.map((candidate) => candidate.id),
+      excludedRouteIds,
+      finalistSelectionSummary,
+      jitCandidateRouteIds: [],
+      bestReadyRouteId,
+      selectionReasonCode: selectionReason.code,
+      selectionReasonDetail: selectionReason.detail,
       allowanceCheck,
-      routeExecutionReadiness: routeCandidates.map((candidate) => {
-        const payloadCandidate = payloadCandidates.find(
-          (payload) => payload.platform === candidate.platform && payload.routeFamily === candidate.routeFamily
-        )
-        const simulationOk = payloadCandidate?.simulation.ok ?? false
-        return {
-          routeId: candidate.id,
-          payloadReady: Boolean(payloadCandidate),
-          simulationOk,
-          liveExecutable: Boolean(
-            payloadCandidate &&
-              simulationOk &&
-              payloadCandidate.executionMode === "self-executed" &&
-              submissionCandidates.some(
-                (submission) =>
-                  submission.submissionChannel === "public-mempool" &&
-                  submission.liveStatus === "live" &&
-                  submission.routeFamilies.includes(candidate.routeFamily)
-              )
-          )
-        }
-      }),
+      routeExecutionReadiness,
       alternativesRejected
     }
   })
@@ -1336,6 +1383,107 @@ export async function* runPlanningStream(input: {
       state: finalState
     }
   })
+}
+
+function buildPayloadDecisionSet(input: {
+  routeCandidates: RouteCandidate[]
+  bestQuotedRouteId: string | null
+}): RouteCandidate[] {
+  const seen = new Set<string>()
+  const orderedIds = [
+    input.bestQuotedRouteId,
+    ...[...input.routeCandidates]
+      .sort((a, b) => {
+        const quoteDiff = BigInt(b.quotedOut) - BigInt(a.quotedOut)
+        if (quoteDiff > 0n) return 1
+        if (quoteDiff < 0n) return -1
+        return b.score - a.score
+      })
+      .slice(0, 3)
+      .map((candidate) => candidate.id)
+  ].filter((value): value is string => Boolean(value))
+
+  const decisionSet: RouteCandidate[] = []
+  for (const routeId of orderedIds) {
+    if (seen.has(routeId)) continue
+    const candidate = input.routeCandidates.find((route) => route.id === routeId)
+    if (!candidate) continue
+    seen.add(routeId)
+    decisionSet.push(candidate)
+    if (decisionSet.length >= 3) break
+  }
+  return decisionSet
+}
+
+function buildFinalistSelectionSummary(input: {
+  finalists: string[]
+  excludedRouteIds: string[]
+}): string {
+  const finalists = input.finalists.length ? input.finalists.join(",") : "none"
+  if (!input.excludedRouteIds.length) {
+    return `kept top-3 quoted output; finalists=${finalists}`
+  }
+  return `kept top-3 quoted output; excluded=${input.excludedRouteIds.join(",")} because they were outside top-3 quoted output and not simulated this round`
+}
+
+function deriveSelectionReason(input: {
+  bestQuoteRouteId: string | null
+  bestReadyRouteId: string | null
+  selectedRouteId: string
+  bestExecutionPackage: ExecutionPackage
+  routeCandidates: RouteCandidate[]
+  payloadCandidates: PayloadCandidate[]
+}): { code: SelectionReasonCode; detail: string } {
+  if (!input.bestQuoteRouteId || input.bestQuoteRouteId === input.selectedRouteId) {
+    return {
+      code: "best-quote-also-selected",
+      detail: "Best quote also won execution."
+    }
+  }
+
+  const bestQuoteRoute = input.routeCandidates.find((route) => route.id === input.bestQuoteRouteId)
+  const bestQuotePayload = bestQuoteRoute
+    ? input.payloadCandidates.find(
+        (payload) =>
+          payload.platform === bestQuoteRoute.platform && payload.routeFamily === bestQuoteRoute.routeFamily
+      )
+    : undefined
+
+  if (!bestQuotePayload) {
+    return {
+      code: "quote-winner-not-buildable",
+      detail: "Best quote route did not produce a buildable payload."
+    }
+  }
+
+  if (!bestQuotePayload.simulation.ok) {
+    return {
+      code: "quote-winner-not-simulated",
+      detail: "Best quote route did not survive simulation."
+    }
+  }
+
+  if (
+    input.bestExecutionPackage.submissionChannel !== "public-mempool" &&
+    input.bestExecutionPackage.routeId === input.selectedRouteId
+  ) {
+    return {
+      code: "private-path-winner",
+      detail: "Selected route won after private-path scoring."
+    }
+  }
+
+  if (input.bestReadyRouteId === input.selectedRouteId) {
+    return {
+      code: "simulation-winner",
+      detail: "Selected route won among simulated candidates."
+    }
+  }
+
+  return {
+    code: "execution-package-winner",
+    detail: "Selected route won the execution package comparison."
+  }
 }
 
 export async function planSwap(input: {

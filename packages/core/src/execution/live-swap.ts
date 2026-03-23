@@ -96,16 +96,19 @@ export async function executePlannedPrivateSwap(input: {
     }
   }
 
-  const jitRequest = await buildLiveJitRequest({
-    result: input.result,
-    registry: input.registry,
-    network: input.network,
-    walletAddress: account.address,
-    sellToken,
-    buyToken,
-    amountIn,
-    client
-  })
+  const jitRequest =
+    input.result.executionRecommendationMode === "jit-best-of-3"
+      ? await buildLiveJitRequest({
+          result: input.result,
+          registry: input.registry,
+          network: input.network,
+          walletAddress: account.address,
+          sellToken,
+          buyToken,
+          amountIn,
+          client
+        })
+      : undefined
 
   const registry = await loadPrivateSubmissionRegistry()
   const maxEndpoints = input.maxEndpoints ?? Number(process.env.PRIVATE_SUBMIT_MAX_ENDPOINTS ?? DEFAULT_BUILDER_TARGETS)
@@ -127,10 +130,12 @@ export async function executePlannedPrivateSwap(input: {
   let swapTx: { to: Address; data: Hex; value: bigint }
   let expectedQuoteOut = selectedPayload.minOutAmount
   let protectedMinOut = selectedPayload.minOutAmount
+  let armedCandidateRouteIds: string[] | undefined
 
   if (jitRequest) {
     executionVariant = "jit-v21"
     approvalSpender = jitRequest.approvalSpender
+    armedCandidateRouteIds = jitRequest.candidates.map((candidate) => candidate.routeId)
     const signature = await walletClient.signTypedData({
       account,
       ...(buildJitOrderTypedData({
@@ -258,7 +263,8 @@ export async function executePlannedPrivateSwap(input: {
       recipient: account.address as `0x${string}`,
       expectedQuoteOut,
       protectedMinOut,
-      executionPath: "builder-aware-broadcast"
+      executionPath: "builder-aware-broadcast",
+      armedCandidateRouteIds
     },
     onTrace: input.onTrace
   })
@@ -287,7 +293,10 @@ export async function executePlannedPrivateSwap(input: {
     signing: swapPhase.signing,
     submission: swapPhase.submission,
     audit: swapPhase.audit,
-    feedback
+    feedback,
+    executedRouteId: swapPhase.audit?.executedRouteId,
+    jitSelectedCandidateIndex: swapPhase.audit?.jitSelectedCandidateIndex,
+    armedCandidateRouteIds
   }
 }
 
@@ -378,7 +387,11 @@ async function buildLiveJitRequest(input: {
   }
 
   const liveCandidates = input.result.routeCandidates
-    .filter((route) => ALLOWED_JIT_PLATFORMS.includes(route.id as (typeof ALLOWED_JIT_PLATFORMS)[number]))
+    .filter((route) =>
+      input.result.jitCandidateRouteIds?.length
+        ? input.result.jitCandidateRouteIds.includes(route.id)
+        : ALLOWED_JIT_PLATFORMS.includes(route.id as (typeof ALLOWED_JIT_PLATFORMS)[number])
+    )
     .filter((route) => route.providerNative && route.routeSourceType === "native")
     .filter((route) => {
       const readiness = input.result.routeExecutionReadiness.find((item) => item.routeId === route.id)
@@ -478,6 +491,7 @@ async function executePrivatePhase(input: {
     expectedQuoteOut?: string
     protectedMinOut?: string
     executionPath?: ExecutionAudit["executionPath"]
+    armedCandidateRouteIds?: string[]
   }
 }): Promise<SwapExecutionPhaseSummary> {
   const nonce = await input.client.getTransactionCount({ address: input.account.address, blockTag: "pending" })
@@ -506,6 +520,7 @@ async function executePrivatePhase(input: {
   const submittedAtIso = new Date().toISOString()
   const startedAtMonotonicMs = performance.now()
   const submittedBlockNumber = await input.client.getBlockNumber()
+  input.onTrace?.(`${input.phase} submit started at=${submittedAtIso} block=${submittedBlockNumber}`)
   const results = await broadcastPrivateRawTransaction({
     rawTransaction,
     network: input.network,
@@ -571,6 +586,7 @@ async function executePrivatePhase(input: {
     recipient: input.audit?.recipient,
     expectedQuoteOut: input.audit?.expectedQuoteOut,
     protectedMinOut: input.audit?.protectedMinOut,
+    armedCandidateRouteIds: input.audit?.armedCandidateRouteIds,
     executionPath: input.audit?.executionPath ?? "builder-aware-broadcast",
     phase: input.phase,
     onTrace: input.onTrace
@@ -601,6 +617,7 @@ async function waitForAudit(input: {
   submittedAtIso: string
   submittedAtMonotonicMs: number
   submittedBlockNumber: bigint
+  armedCandidateRouteIds?: string[]
   executionPath: ExecutionAudit["executionPath"]
   phase: "approval" | "swap"
   onTrace?: (line: string) => void
@@ -638,7 +655,7 @@ async function waitForAudit(input: {
   })
   if (audit.status === "success") {
     input.onTrace?.(
-      `${input.phase} receipt success block=${audit.blockNumber?.toString() ?? "unknown"} blocks=${audit.inclusionBlockDelta ?? "unknown"} wall=${audit.inclusionWallClockMs ?? 0}ms`
+      `${input.phase} receipt success block=${audit.blockNumber?.toString() ?? "unknown"} blocks=${audit.inclusionBlockDelta ?? "unknown"} wall=${audit.inclusionWallClockMs ?? 0}ms${audit.confirmedAt ? ` at=${audit.confirmedAt}` : ""}`
     )
   } else {
     input.onTrace?.(`${input.phase} receipt ${audit.status}`)

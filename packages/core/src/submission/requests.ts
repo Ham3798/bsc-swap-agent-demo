@@ -16,6 +16,7 @@ const CHAIN_IDS: Record<Network, number> = {
   bsc: 56,
   "bsc-testnet": 97
 }
+const JIT_SUPPORTED_ROUTE_IDS = ["openoceanv2", "1inch", "pancakeswap"] as const
 
 export function buildPublicTransactionRequest(input: {
   network: Network
@@ -239,38 +240,11 @@ export function attachSubmissionRequests(input: {
         })
       : undefined
 
-  const jitCandidates =
-    input.walletAddress && input.buyTokenAddress
-      ? input.result.routeExecutionReadiness
-          .filter((candidate) => candidate.payloadReady && candidate.simulationOk)
-          .slice(0, 3)
-          .map((candidate) => ({
-            routeId: candidate.routeId,
-            payload: input.result.payloadCandidates.find((payloadCandidate) => payloadCandidate.id === candidate.routeId) ??
-              input.result.payloadCandidates.find(
-                (payloadCandidate) =>
-                  payloadCandidate.platform ===
-                    input.result.routeCandidates.find((route) => route.id === candidate.routeId)?.platform &&
-                  payloadCandidate.routeFamily ===
-                    input.result.routeCandidates.find((route) => route.id === candidate.routeId)?.routeFamily
-              )
-          }))
-          .filter((candidate): candidate is { routeId: string; payload: PayloadCandidate } => Boolean(candidate.payload))
-      : []
+  const jitRouterRequest = undefined
 
-  const jitRouterRequest =
-    input.walletAddress && input.buyTokenAddress
-      ? buildJitRouterRequest({
-          network: input.network,
-          walletAddress: input.walletAddress,
-          sellTokenAddress: undefined,
-          buyTokenAddress: input.buyTokenAddress,
-          amountIn: undefined,
-          maxBlockNumber: undefined,
-          candidates: jitCandidates,
-          guardrails: input.result.guardrails
-        })
-      : undefined
+  const executionRecommendationMode = "direct-route"
+  const bestExecutableRouteId = input.result.bestExecutableRouteId ?? input.result.recommendedPlan.routeId
+  const jitCandidateRouteIds: string[] = []
 
   const recommendedHandoff =
     payload.executionMode !== "self-executed"
@@ -289,8 +263,15 @@ export function attachSubmissionRequests(input: {
     privateSubmitRequest,
     intentSubmitRequest,
     jitRouterRequest,
-    recommendedHandoff
+    recommendedHandoff,
+    executionRecommendationMode,
+    bestExecutableRouteId,
+    jitCandidateRouteIds
   }
+}
+
+function isJitSupportedRoute(routeId: string): boolean {
+  return JIT_SUPPORTED_ROUTE_IDS.includes(routeId as (typeof JIT_SUPPORTED_ROUTE_IDS)[number])
 }
 
 function resolveJitAdapterId(routeId: string): number | undefined {

@@ -388,6 +388,14 @@ export interface RecommendedPlan {
   policyNote: string
 }
 
+export type SelectionReasonCode =
+  | "best-quote-also-selected"
+  | "simulation-winner"
+  | "private-path-winner"
+  | "execution-package-winner"
+  | "quote-winner-not-buildable"
+  | "quote-winner-not-simulated"
+
 export interface AlternativeRejected {
   routeId: string
   reason: string
@@ -469,6 +477,8 @@ export interface JitRouterRequest {
   note: string
 }
 
+export type ExecutionRecommendationMode = "jit-best-of-3" | "direct-route"
+
 export interface PrivateSubmissionResult {
   endpointId: string
   displayName: string
@@ -484,6 +494,9 @@ export interface ExecutionAudit {
   txHash: string
   chainId: number
   blockNumber?: bigint
+  submittedAt?: string
+  submittedBlockNumber?: string
+  confirmedAt?: string
   inclusionBlockDelta?: number
   status: "success" | "reverted" | "pending" | "not-found"
   gasUsed?: bigint
@@ -501,6 +514,9 @@ export interface ExecutionAudit {
   quoteDeltaRaw?: string
   minOutDeltaRaw?: string
   executionPath?: "public-mempool" | "private-rpc" | "builder-aware-broadcast" | "unknown"
+  executedRouteId?: string
+  jitSelectedCandidateIndex?: number
+  armedCandidateRouteIds?: string[]
 }
 
 export interface SwapExecutionSigningSummary {
@@ -560,6 +576,9 @@ export interface SwapExecutionSummary {
   submission?: SwapExecutionSubmissionSummary
   audit?: ExecutionAudit
   feedback?: SwapExecutionFeedback
+  executedRouteId?: string
+  jitSelectedCandidateIndex?: number
+  armedCandidateRouteIds?: string[]
 }
 
 export interface IntentSubmissionRequest {
@@ -750,6 +769,18 @@ export function toUserFacingErrorMessage(error: string): string {
     return "The planner request failed before live updates could start."
   }
 
+  if (trimmed.includes("Intent parsing unavailable: Gemini quota exhausted")) {
+    return "Intent parsing unavailable: Gemini quota exhausted"
+  }
+
+  if (trimmed.includes("Intent parsing failed: Gemini returned an invalid response")) {
+    return "Intent parsing failed: Gemini returned an invalid response"
+  }
+
+  if (trimmed.includes("Intent parsing failed: could not extract swap intent")) {
+    return "Intent parsing failed: could not extract swap intent"
+  }
+
   const tokenSuggestionMatch = trimmed.match(/^Could not resolve token '(.+)' on ([a-z-]+)\.\s*suggest\s+(.+)$/i)
   if (tokenSuggestionMatch) {
     return `Could not resolve token '${tokenSuggestionMatch[1]}' on ${tokenSuggestionMatch[2]}. Did you mean ${tokenSuggestionMatch[3]}?`
@@ -818,8 +849,16 @@ export interface PlanningResult {
   effectiveSlippageBps: number
   executionReadyNow: boolean
   recommendedHandoff: "public-wallet" | "private-rpc-handoff" | "builder-broadcast-handoff" | "none"
+  executionRecommendationMode: ExecutionRecommendationMode
   bestQuoteRouteId: string | null
+  bestExecutableRouteId?: string | null
+  finalistsRouteIds?: string[]
+  excludedRouteIds?: string[]
+  finalistSelectionSummary?: string
+  jitCandidateRouteIds?: string[]
   bestReadyRouteId: string | null
+  selectionReasonCode?: SelectionReasonCode
+  selectionReasonDetail?: string
   routeExecutionReadiness: RouteExecutionReadiness[]
   allowanceCheck?: AllowanceCheckSummary
   alternativesRejected: AlternativeRejected[]

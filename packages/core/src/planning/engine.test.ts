@@ -517,6 +517,93 @@ class ApprovalBlockedQuoteAdapter extends MockQuoteAdapter {
   }
 }
 
+class BiasedRouteQuoteAdapter extends MockQuoteAdapter {
+  override async getQuoteCandidatesWithAudit(): Promise<any> {
+    return {
+      observedAt: new Date().toISOString(),
+      audit: [
+        { providerId: "paraswap", category: "aggregator", mode: "native", status: "observed", quoteCount: 1 },
+        { providerId: "openoceanv2", category: "aggregator", mode: "native", status: "observed", quoteCount: 1 },
+        { providerId: "1inch", category: "aggregator", mode: "native", status: "observed", quoteCount: 1 }
+      ],
+      candidates: [
+        {
+          id: "paraswap",
+          platform: "paraswap",
+          routeFamily: "aggregator",
+          quoteSource: "paraswap",
+          routeSourceType: "native",
+          quoteMethod: "aggregator-http",
+          providerNative: true,
+          providerUniverseCategory: "aggregator",
+          feasibilityStatus: "implement-now",
+          quotedOut: "1010000000000000000",
+          quotedOutFormatted: "1.01 BNB",
+          priceImpactPct: 1.1,
+          estimatedGas: "120000",
+          expectedExecutionStability: "low",
+          protocolFit: "aggregator",
+          mevExposure: "high",
+          coverageConfidence: "medium",
+          coverageNotes: [],
+          quoteRequestNotes: [],
+          routeSummary: "paraswap",
+          dexes: [{ dexCode: "PancakeV3", shareBps: 7000 }],
+          score: 0
+        },
+        {
+          id: "openoceanv2",
+          platform: "openoceanv2",
+          routeFamily: "aggregator",
+          quoteSource: "openocean",
+          routeSourceType: "native",
+          quoteMethod: "aggregator-http",
+          providerNative: true,
+          providerUniverseCategory: "aggregator",
+          feasibilityStatus: "implement-now",
+          quotedOut: "1000000000000000000",
+          quotedOutFormatted: "1.0 BNB",
+          priceImpactPct: 0.1,
+          estimatedGas: "100000",
+          expectedExecutionStability: "high",
+          protocolFit: "aggregator",
+          mevExposure: "low",
+          coverageConfidence: "medium",
+          coverageNotes: [],
+          quoteRequestNotes: [],
+          routeSummary: "openocean",
+          dexes: [{ dexCode: "PancakeV3", shareBps: 7000 }],
+          score: 0
+        },
+        {
+          id: "1inch",
+          platform: "1inch",
+          routeFamily: "aggregator",
+          quoteSource: "1inch",
+          routeSourceType: "native",
+          quoteMethod: "aggregator-http",
+          providerNative: true,
+          providerUniverseCategory: "aggregator",
+          feasibilityStatus: "implement-now",
+          quotedOut: "990000000000000000",
+          quotedOutFormatted: "0.99 BNB",
+          priceImpactPct: 0.2,
+          estimatedGas: "110000",
+          expectedExecutionStability: "medium",
+          protocolFit: "aggregator",
+          mevExposure: "medium",
+          coverageConfidence: "medium",
+          coverageNotes: [],
+          quoteRequestNotes: [],
+          routeSummary: "1inch",
+          dexes: [{ dexCode: "PancakeV3", shareBps: 7000 }],
+          score: 0
+        }
+      ]
+    }
+  }
+}
+
 describe("core planning engine", () => {
   const mockStageSummarizer: StageSummarizer = async (input) => ({
     summary: `LLM summary for ${input.stage}`,
@@ -788,7 +875,11 @@ describe("core planning engine", () => {
     expect(result.effectiveSlippageBps).toBe(50)
     expect(result.executionReadyNow).toBeTruthy()
     expect(result.bestQuoteRouteId).toBeTruthy()
+    expect(result.bestExecutableRouteId).toBeTruthy()
+    expect(result.finalistsRouteIds?.length).toBeGreaterThan(0)
     expect(result.bestReadyRouteId).toBeTruthy()
+    expect(["jit-best-of-3", "direct-route"]).toContain(result.executionRecommendationMode)
+    expect(Array.isArray(result.jitCandidateRouteIds)).toBe(true)
     expect(result.jitRouterRequest).toBeUndefined()
     expect(result.providerUniverseSnapshot.modeledAdapters).toContain("Matcha / 0x")
     expect(result.alternativesRejected.length).toBeGreaterThanOrEqual(1)
@@ -1049,5 +1140,62 @@ describe("core planning engine", () => {
 
     expect(message).toContain("Could not resolve token")
     expect(message).toContain("Did you mean CAKE")
+  })
+
+  it("emits intent-parsing failure events before throwing", async () => {
+    const registry = new MockRegistry()
+    const events: PlanningEvent[] = []
+
+    await expect(async () => {
+      for await (const event of runPlanningStream({
+        message: "Change all my USDC tokens to BNB",
+        context: {
+          network: "bsc" as Network,
+          walletAddress: "0xwallet",
+          submitEnabled: false
+        },
+        registry,
+        intentExtractor: async () => {
+          throw new Error("Intent parsing failed: Gemini returned an invalid response")
+        }
+      })) {
+        events.push(event)
+      }
+    }).toThrow("Intent parsing failed: Gemini returned an invalid response")
+
+    expect(events[0]?.kind).toBe("stage-started")
+    expect(events[0]?.stage).toBe("intent-parsing")
+    expect(events[1]?.kind).toBe("stage-failed")
+    expect(events[1]?.stage).toBe("intent-parsing")
+  })
+
+  it("includes both best quote and execution winner in payload decision candidates", async () => {
+    const registry = new MockRegistry()
+    registry.quote = new BiasedRouteQuoteAdapter()
+
+    const events: PlanningEvent[] = []
+    for await (const event of runPlanningStream({
+      message: "Swap 100 USDT to BNB",
+      context: { network: "bsc", walletAddress: "0xabc" },
+      registry,
+      intentExtractor: mockIntentExtractor,
+      stageSummarizer: mockStageSummarizer
+    })) {
+      events.push(event)
+    }
+
+    const payloadStarts = events.filter(
+      (event) => event.stage === "payload-construction" && event.kind === "tool-started" && event.data?.toolName === "encodeRouterCalldata"
+    )
+    const routes = payloadStarts.map((event) => event.data?.inputPreview?.find((field) => field.label === "route")?.value)
+    expect(routes).toContain("paraswap")
+    expect(routes).toContain("openoceanv2")
+
+    const planCompleted = events.find((event) => event.kind === "plan-completed")
+    expect(planCompleted?.data?.result?.bestQuoteRouteId).toBe("paraswap")
+    expect(planCompleted?.data?.result?.recommendedPlan.routeId).toBe("openoceanv2")
+    expect(planCompleted?.data?.result?.selectionReasonCode).toBe("private-path-winner")
+    expect(planCompleted?.data?.result?.finalistsRouteIds?.length).toBeGreaterThan(0)
+    expect(planCompleted?.data?.result?.finalistSelectionSummary).toContain("top-3 quoted output")
   })
 })

@@ -6,17 +6,22 @@ import { toUserFacingErrorMessage } from "@bsc-swap-agent-demo/shared"
 import { BnbCapabilityRegistry } from "../capabilities/registry"
 import { executePlannedPrivateSwap } from "../execution/live-swap"
 import {
+  applyDashboardFailure,
+  applyExecutionTraceToDashboard,
+  applyPlanningEventToDashboard,
+  createDashboardState,
   formatExecutedSwap,
-  formatCliCheckpoint,
-  formatCliStreamingEvent,
   formatDebugPlan,
   formatPlan,
+  finalizeDashboardFromExecution,
+  renderDashboard,
   toDebugJson,
   toPresentationJson
 } from "../format/output"
 import { finalizePlan, streamPlanningContinuation, streamPlanningSession } from "../session/store"
 
 loadEnv()
+let lastDashboardRender = ""
 
 async function main() {
   const args = process.argv.slice(2)
@@ -28,8 +33,11 @@ async function main() {
   const rawInput = args.filter((arg) => !arg.startsWith("--")).join(" ")
   const rl = readline.createInterface({ input, output })
   const registry = new BnbCapabilityRegistry()
-  const emittedCheckpoints = new Set<string>()
+  const network = ((process.env.DEMO_NETWORK as "bsc" | "bsc-testnet" | undefined) ?? "bsc")
   let liveEvents: import("@bsc-swap-agent-demo/shared").PlanningEvent[] = []
+  let dashboard = createDashboardState(rawInput, network)
+  const dashboardMode = !debugMode && !jsonMode && !debugJsonMode && Boolean(output.isTTY)
+  lastDashboardRender = ""
 
   try {
     if (!process.env.GEMINI_API_KEY) {
@@ -43,14 +51,15 @@ async function main() {
     }
 
     const initialPrompt = rawInput || (await rl.question("User: "))
+    dashboard = createDashboardState(initialPrompt, network)
     const sessionId = crypto.randomUUID()
-    if (!debugMode && !jsonMode && !debugJsonMode) {
-      console.log("Thinking...")
+    if (dashboardMode) {
+      drawIfChanged(renderDashboard(dashboard))
     }
     let stream = streamPlanningSession({
       sessionId,
       message: initialPrompt,
-      network: (process.env.DEMO_NETWORK as "bsc" | "bsc-testnet") || "bsc",
+      network,
       walletAddress: process.env.DEMO_WALLET_ADDRESS || undefined,
       registry
     })
@@ -67,23 +76,9 @@ async function main() {
           } else {
             console.log(`[${event.stage}] ${event.kind}: ${event.message}`)
           }
-        } else if (!jsonMode && !debugJsonMode) {
-          const checkpoint = checkpointForEvent(event)
-          if (checkpoint && !emittedCheckpoints.has(checkpoint)) {
-            const checkpointBlock = formatCliCheckpoint({
-              events: liveEvents,
-              checkpoint,
-              result: event.kind === "plan-completed" ? event.data?.result : undefined
-            })
-            if (checkpointBlock) {
-              emittedCheckpoints.add(checkpoint)
-              console.log(checkpointBlock)
-            }
-          }
-          const cliLine = formatCliStreamingEvent(event)
-          if (cliLine) {
-            console.log(cliLine)
-          }
+        } else if (dashboardMode) {
+          dashboard = applyPlanningEventToDashboard(dashboard, event)
+          drawIfChanged(renderDashboard(dashboard))
         }
         if (event.kind === "follow-up-required") {
           followUpQuestion = event.data?.question ?? event.message
@@ -108,17 +103,22 @@ async function main() {
     const execution = shouldExecuteLive
       ? await executePlannedPrivateSwap({
           result,
-          network: (process.env.DEMO_NETWORK as "bsc" | "bsc-testnet") || "bsc",
+          network,
           walletAddress: process.env.DEMO_WALLET_ADDRESS || undefined,
           registry,
           onTrace:
-            !debugMode && !jsonMode && !debugJsonMode
+            dashboardMode
               ? (line) => {
-                  console.log(line)
+                  dashboard = applyExecutionTraceToDashboard(dashboard, line)
+                  drawIfChanged(renderDashboard(dashboard))
                 }
               : undefined
         })
       : undefined
+    if (dashboardMode) {
+      dashboard = finalizeDashboardFromExecution(dashboard, result, execution)
+      drawIfChanged(renderDashboard(dashboard))
+    }
     const rendered = debugJsonMode
       ? JSON.stringify({ plan: toDebugJson(result), execution }, null, 2)
       : jsonMode
@@ -128,10 +128,24 @@ async function main() {
           : execution
             ? formatExecutedSwap(result, execution)
             : formatPlan(result)
-    console.log(`\nAssistant:\n${rendered}\n`)
+    if (dashboardMode) {
+      output.write("\n")
+    } else {
+      console.log(`\nAssistant:\n${rendered}\n`)
+    }
   } catch (error) {
     const message = error instanceof Error ? toUserFacingErrorMessage(error.message) : "Planning failed."
-    console.log(`\nAssistant:\n${message}\n`)
+    if (dashboardMode) {
+      const failureKind =
+        dashboard.swap.txHash || dashboard.swap.nonce || dashboard.phase === "submitting" || dashboard.phase === "confirmed"
+          ? "execution"
+          : "planning"
+      dashboard = applyDashboardFailure(dashboard, message, failureKind, "unknown")
+      drawIfChanged(renderDashboard(dashboard), true)
+      output.write("\n")
+    } else {
+      console.log(`\nAssistant:\n${message}\n`)
+    }
   } finally {
     await registry.close()
     rl.close()
@@ -140,17 +154,15 @@ async function main() {
 
 void main()
 
-function checkpointForEvent(
-  event: import("@bsc-swap-agent-demo/shared").PlanningEvent
-): "intent" | "tokens" | "quotes" | "payload" | "submission" | "ready" | null {
-  if (event.kind === "tool-succeeded" && event.stage === "liquidity-discovery" && event.data?.toolName === "resolveToken") {
-    return "tokens"
+function drawDashboard(content: string) {
+  output.write("\u001b[2J\u001b[H")
+  output.write(`${content}\n`)
+}
+
+function drawIfChanged(content: string, force = false) {
+  if (!force && content === lastDashboardRender) {
+    return
   }
-  if (event.kind !== "stage-completed") {
-    return null
-  }
-  if (event.stage === "execution-family-selection") {
-    return "intent"
-  }
-  return null
+  lastDashboardRender = content
+  drawDashboard(content)
 }

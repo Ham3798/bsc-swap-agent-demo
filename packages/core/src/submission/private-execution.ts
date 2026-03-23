@@ -14,6 +14,18 @@ import {
   type PrivateSubmissionRegistry
 } from "./private-registry"
 
+const JIT_ROUTER_V21_EVENT_ABI = [
+  {
+    type: "event",
+    name: "CandidateSelected",
+    inputs: [
+      { indexed: true, name: "index", type: "uint256" },
+      { indexed: true, name: "adapterId", type: "uint8" },
+      { indexed: false, name: "receivedAmount", type: "uint256" }
+    ]
+  }
+] as const
+
 type SubmissionChannel = "validator" | "builder" | "both"
 
 export async function broadcastPrivateRawTransaction(input: {
@@ -52,6 +64,7 @@ export async function auditExecution(input: {
   submittedBlockNumber?: bigint | number | string
   inclusionWallClockMs?: number
   executionPath?: ExecutionAudit["executionPath"]
+  armedCandidateRouteIds?: string[]
 }): Promise<ExecutionAudit> {
   const client = createRpcClient(input.network)
   const chainId = await client.getChainId()
@@ -91,11 +104,18 @@ export async function auditExecution(input: {
           recipient: input.recipient
         })
       : undefined
+  const jitSelection = deriveJitSelection({
+    receipt,
+    armedCandidateRouteIds: input.armedCandidateRouteIds
+  })
 
   return {
     txHash: input.txHash,
     chainId,
     blockNumber: receipt.blockNumber,
+    submittedAt: submittedAtMs ? new Date(submittedAtMs).toISOString() : undefined,
+    submittedBlockNumber: submittedBlockNumber?.toString(),
+    confirmedAt: block?.timestamp ? new Date(Number(block.timestamp) * 1000).toISOString() : undefined,
     inclusionBlockDelta:
       submittedBlockNumber != null ? Number(receipt.blockNumber - submittedBlockNumber) : undefined,
     status: receipt.status === "success" ? "success" : "reverted",
@@ -118,8 +138,44 @@ export async function auditExecution(input: {
         : undefined,
     minOutDeltaRaw:
       realizedOut && input.protectedMinOut ? (BigInt(realizedOut) - BigInt(input.protectedMinOut)).toString() : undefined,
-    executionPath: input.executionPath ?? "unknown"
+    executionPath: input.executionPath ?? "unknown",
+    executedRouteId: jitSelection.executedRouteId,
+    jitSelectedCandidateIndex: jitSelection.jitSelectedCandidateIndex,
+    armedCandidateRouteIds: input.armedCandidateRouteIds
   }
+}
+
+function deriveJitSelection(input: {
+  receipt: Awaited<ReturnType<ReturnType<typeof createRpcClient>["getTransactionReceipt"]>>
+  armedCandidateRouteIds?: string[]
+}): { executedRouteId?: string; jitSelectedCandidateIndex?: number } {
+  if (!input.armedCandidateRouteIds?.length) {
+    return {}
+  }
+
+  for (const log of input.receipt.logs) {
+    try {
+      const decoded = decodeEventLog({
+        abi: JIT_ROUTER_V21_EVENT_ABI,
+        data: log.data,
+        topics: log.topics
+      })
+      if (decoded.eventName !== "CandidateSelected") continue
+      const rawIndex = decoded.args.index
+      const index = typeof rawIndex === "bigint" ? Number(rawIndex) : Number(rawIndex ?? NaN)
+      if (!Number.isFinite(index) || index < 0 || index >= input.armedCandidateRouteIds.length) {
+        return {}
+      }
+      return {
+        executedRouteId: input.armedCandidateRouteIds[index],
+        jitSelectedCandidateIndex: index
+      }
+    } catch {
+      continue
+    }
+  }
+
+  return {}
 }
 
 function pickSubmissionEndpoints(input: {
